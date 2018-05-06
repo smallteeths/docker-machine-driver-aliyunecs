@@ -1,3 +1,6 @@
 bin
 .idea
 docker-machine-driver-aliyunecs
+dist
+.vscode
+.dapper
