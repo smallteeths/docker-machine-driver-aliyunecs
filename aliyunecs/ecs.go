@@ -34,7 +34,7 @@ const (
 	defaultRootSize          = 20
 	internetChargeType       = "PayByTraffic"
 	ipRange                  = "0.0.0.0/0"
-	machineSecurityGroupName = "docker-machine"
+	machineSecurityGroupName = "rancher-machine"
 	vpcCidrBlock             = "10.0.0.0/8"
 	vSwitchCidrBlock         = "10.1.0.0/24"
 	timeout                  = 300
@@ -422,7 +422,6 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		return fmt.Errorf("Unsupport file system for data disk: %s", d.DiskFS)
 	}
 
-
 	if d.SSHPrivateKeyPath == "" && d.SSHKeyPairName != "" {
 		return fmt.Errorf("using --aliyunecs-keypair-name also requires --aliyunecs-ssh-keypath")
 	}
@@ -467,7 +466,6 @@ func (d *Driver) Create() error {
 	if err := d.createKeyPair(); err != nil {
 		return fmt.Errorf("%s | Failed to create key pair: %v", d.MachineName, err)
 	}
-
 
 	log.Infof("%s | Configuring security groups instance ...", d.MachineName)
 	if err := d.configureSecurityGroup(VpcId, d.SecurityGroupName); err != nil {
@@ -1096,7 +1094,7 @@ func (d *Driver) configureSecurityGroup(vpcId string, groupName string) error {
 		creationArgs := ecs.CreateSecurityGroupArgs{
 			RegionId:          d.Region,
 			SecurityGroupName: groupName,
-			Description:       "Docker Machine",
+			Description:       "Rancher Machine",
 			VpcId:             vpcId,
 			ClientToken:       d.getClient().GenerateClientToken(),
 		}
@@ -1220,6 +1218,24 @@ func (d *Driver) configureSecurityGroupPermissions(group *ecs.DescribeSecurityGr
 		IpRange:    ipRange,
 	})
 
+	//rke begin
+	//apiserver
+	perms = append(perms, IpPermission{
+		IpProtocol: ecs.IpProtocolTCP,
+		FromPort:   6443,
+		ToPort:     6443,
+		IpRange:    ipRange,
+	})
+
+	//etcd
+	perms = append(perms, IpPermission{
+		IpProtocol: ecs.IpProtocolTCP,
+		FromPort:   2379,
+		ToPort:     2380,
+		IpRange:    ipRange,
+	})
+
+	//rke end
 	//如果是容器网段的话，需要设置容器网段开放安全组
 	if d.VpcId != "" || d.VSwitchId != "" {
 		containerIPRange, err := getContainerCIDR(d.RouteCIDR)
