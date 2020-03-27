@@ -1,0 +1,23 @@
+---
+pipeline:
+  build:
+    privileged: true
+    image: rancher/dapper:1.11.2
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+    - dapper ci
+
+  github-binary-publish-release:
+    image: plugins/github-release
+    files:
+    - "dist/*"
+    checksum:
+     - sha256
+    secrets: [github_token]
+    when:
+      ref:
+      - refs/head/master
+      - refs/tags/*      
+      event: 
+      - tag
