@@ -29,13 +29,42 @@ go get github.com/AliyunContainerService/docker-machine-driver-aliyunecs
 
 binaries also available,you can download from below links:
 
-* Mac OSX 64 bit: [docker-machine-driver-aliyunecs_darwin-amd64](https://docker-machine-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_darwin-amd64.tgz)
+* Mac OSX 64 bit: [docker-machine-driver-aliyunecs_darwin-amd64](https://docker-machine-aliyunecs-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_darwin-amd64.tgz)
 
-* Linux 64 bit: [docker-machine-driver-aliyunecs_linux-amd64](https://docker-machine-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_linux-amd64.tgz)
+* Linux 64 bit: [docker-machine-driver-aliyunecs_linux-amd64](https://docker-machine-aliyunecs-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_linux-amd64.tgz)
 
-* Windows 64 bit: [docker-machine-driver-aliyunecs_windows-amd64](https://docker-machine-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_windows-amd64.tgz)
+* Windows 64 bit: [docker-machine-driver-aliyunecs_windows-amd64](https://docker-machine-aliyunecs-drivers.oss-cn-beijing.aliyuncs.com/docker-machine-driver-aliyunecs_windows-amd64.tgz)
 
+How to install docker-machine-driver-aliyunecs binary packages on different platforms.
 
+* Download the binary package for the corresponding platform. We currently support Windows, Linux, and MAC platforms
+* Extract the donload package
+
+  eg. Take the Mac platform for example
+  
+	```
+		tar zxvf docker-machine-driver-aliyunecs_darwin-amd64.tgz
+	```
+	
+* Rename the executable
+
+	```
+	#Windows
+	docker-machine-driver-aliyunecs.windows-amd64 => docker-machine-driver-aliyunecs.exe
+	
+	#Linux
+	docker-machine-driver-aliyunecs.linux-amd64 => docker-machine-driver-aliyunecs
+	
+	#Mac
+	docker-machine-driver-aliyunecs.darwin-amd64 => docker-machine-driver-aliyunecs
+	```
+
+* Add docker-machine driver to the environment variables.
+	
+	```
+	export PATH=<Your Local Path>/docker-machine-driver-aliyunecs[.exe]:$PATH
+
+	```
 
 ## Example Usage 
 eg. Export your credentials into your shell environment 
@@ -107,6 +136,7 @@ docker-machine create -d aliyunecs --help
 ``--aliyunecs-io-optimized``| The I/O optimized instance type, the valid values could be `none` (default) or `optimized`||
 ``--aliyunecs-instance-type``| The instance type to run.  Default: `ecs.n4.small`||
 ``--aliyunecs-internet-max-bandwidth``| Maximum bandwidth for Internet access (in Mbps), default 1||
+``--aliyunecs-internet-charge-type``| [Internet charge type](https://www.alibabacloud.com/help/doc-detail/25411.htm), the valid values could be `PayByTraffic` (default) or `PayByBandwidth`||
 ``--aliyunecs-private-address-only``| Use the private IP address only||
 ``--aliyunecs-region``| The region to use when launching the instance. Default: `cn-hangzhou`||
 ``--aliyunecs-route-cidr``| The CIDR to use configure the route entry for the instance in VPC. Sample: 192.168.200.0/24||
@@ -115,11 +145,10 @@ docker-machine create -d aliyunecs --help
 ``--aliyunecs-ssh-password``| SSH password for created virtual machine. Default is random generated.||
 ``--aliyunecs-ssh-keypair``| SSH key pair name ||
 ``--aliyunecs-ssh-keypath``| File path of SSH private key ||
-``--aliyunecs-system-disk-category``|System disk category for instance||
 ``--aliyunecs-tag``| Tag for the instance.||
 ``--aliyunecs-vpc-id``| Your VPC ID to launch the instance in. (required for VPC network only)||
 ``--aliyunecs-vswitch-id``| Your VSwitch ID to launch the instance with. (required for VPC network only)||
-``--aliyunecs-zone``| The availabilty zone to launch the instance||
+``--aliyunecs-zone``| The availability zone to launch the instance||
 
 ## Environment variables and default values:
 
@@ -138,6 +167,7 @@ docker-machine create -d aliyunecs --help
 | `--aliyunecs-aliyunecs-io-optimized`| `ECS_IO_OPTIMIZED`          | `none`           |
 | `--aliyunecs-instance-type`         | `ECS_INSTANCE_TYPE`         | `ecs.t1.small`   |
 | `--aliyunecs-internet-max-bandwidth`| `ECS_INTERNET_MAX_BANDWIDTH`| `1`              |
+| `--aliyunecs-internet-charge-type`  | `ECS_INTERNET_CHARGE_TYPE`  | `PayByTraffic`   |
 | `--aliyunecs-private-address-only`  | `ECS_PRIVATE_ADDR_ONLY`     | `false`          |
 | `--aliyunecs-region`                | `ECS_REGION`                | `cn-hangzhou`    |
 | `--aliyunecs-route-cidr`            | `ECS_ROUTE_CIDR`            | -                |
