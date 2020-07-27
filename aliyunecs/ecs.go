@@ -1352,7 +1352,7 @@ func (d *Driver) configECSInstance(imageId string) error {
 
 	if retriesExceededErr := mcnutils.WaitForSpecificOrError(func() (bool, error) {
 		err = sshClient.Shell("exit")
-		return err == nil, err
+		return err == nil, nil
 	}, maxRetry, defaultInterval*time.Second); retriesExceededErr != nil {
 		if removeErr := mcnutils.WaitForSpecificOrError(func() (bool, error) {
 			err = d.Remove()
