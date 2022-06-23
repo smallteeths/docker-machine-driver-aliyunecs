@@ -60,8 +60,8 @@ func NewSLBClientWithSecurityToken(accessKeyId string, accessKeySecret string, s
 //Only for hangzhou
 func NewSLBClientWithSecurityToken4RegionalDomain(accessKeyId string, accessKeySecret string, securityToken string, regionID common.Region) *Client {
 	endpoint := os.Getenv("SLB_ENDPOINT")
-	if endpoint == "" {
-		endpoint = SLBDefaultEndpoint
+	if endpoint != "" {
+		return NewSLBClientWithEndpointAndSecurityToken(endpoint, accessKeyId, accessKeySecret, securityToken, regionID)
 	}
 
 	return NewSLBClientWithEndpointAndSecurityToken4RegionalDomain(endpoint, accessKeyId, accessKeySecret, securityToken, regionID)
