@@ -82,6 +82,13 @@ type Driver struct {
 	SystemDiskCategory      ecs.DiskCategory
 	SystemDiskSize          int
 	ResourceGroupId         string
+	// PANDARIA
+	InstanceChargeType common.InstanceChargeType
+	Period             int
+	PeriodUnit         common.TimeType
+	SpotStrategy       ecs.SpotStrategyType
+	SpotPriceLimit     string
+	SpotDuration       int
 
 	client    *ecs.Client
 	slbClient *slb.Client
@@ -253,6 +260,43 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Value:  "",
 			EnvVar: "RESOURCE_GROUP_ID",
 		},
+		// PANDARIA
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-instance-charge-type",
+			Usage:  "The way instances are paid for",
+			Value:  "",
+			EnvVar: "INSTANCE_CHARGE_TYPE",
+		},
+		mcnflag.IntFlag{
+			Name:   "aliyunecs-period",
+			Usage:  "Length of purchased resources",
+			Value:  0,
+			EnvVar: "PERIOD",
+		},
+		mcnflag.IntFlag{
+			Name:   "aliyunecs-spot-duration",
+			Usage:  "Length of spot duration",
+			Value:  1,
+			EnvVar: "SPOT_DURATION",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-period-unit",
+			Usage:  "Length of purchased resources",
+			Value:  "",
+			EnvVar: "PERIOD_UNIT",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-spot-strategy",
+			Usage:  "Instance preemption strategy",
+			Value:  "",
+			EnvVar: "SPOT_STRATEGY",
+		},
+		mcnflag.StringFlag{
+			Name:   "aliyunecs-spot-priceLimit",
+			Usage:  "Set the maximum price per hour for the instance",
+			Value:  "",
+			EnvVar: "SPOT_PRICELIMIT",
+		},
 	}
 }
 
@@ -348,6 +392,13 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SystemDiskCategory = ecs.DiskCategory(flags.String("aliyunecs-system-disk-category"))
 	d.SystemDiskSize = flags.Int("aliyunecs-system-disk-size")
 	d.ResourceGroupId = flags.String("aliyunecs-resource-group-id")
+	// PANDARIA
+	d.InstanceChargeType = common.InstanceChargeType(flags.String("aliyunecs-instance-charge-type"))
+	d.Period = flags.Int("aliyunecs-period")
+	d.PeriodUnit = common.TimeType(flags.String("aliyunecs-period-unit"))
+	d.SpotStrategy = ecs.SpotStrategyType(flags.String("aliyunecs-spot-strategy"))
+	d.SpotPriceLimit = flags.String("aliyunecs-spot-priceLimit")
+	d.SpotDuration = flags.Int("aliyunecs-spot-duration")
 
 	tagMap := make(map[string]string)
 	if len(tags) > 0 {
@@ -432,6 +483,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		return fmt.Errorf("using --aliyunecs-keypair-name also requires --aliyunecs-ssh-keypath")
 	}
 
+	// Pandaria
+	if d.InstanceChargeType == "PrePaid" && d.Period == 0 {
+		return fmt.Errorf("using --instance-charge-type=PrePaid aslo requires --Period")
+	}
+
 	return nil
 }
 
@@ -487,6 +543,15 @@ func (d *Driver) Create() error {
 	imageID := d.GetImageID(d.ImageID)
 	log.Infof("%s | Creating instance with image %s ...", d.MachineName, imageID)
 
+	// Pandaria
+	var spotPriceLimit float64
+	if d.InstanceChargeType == "PostPaid" && d.SpotStrategy == "SpotWithPriceLimit" && d.SpotPriceLimit != "" {
+		spotPriceLimit, err = strconv.ParseFloat(d.SpotPriceLimit, 64)
+		if err != nil {
+			return fmt.Errorf("%s | SpotPriceLimit failed to parse float: %v", d.MachineName, err)
+		}
+	}
+
 	args := ecs.CreateInstanceArgs{
 		RegionId:           d.Region,
 		InstanceName:       d.GetMachineName(),
@@ -500,6 +565,12 @@ func (d *Driver) Create() error {
 		VSwitchId:          VSwitchId,
 		ZoneId:             d.Zone,
 		ClientToken:        d.getClient().GenerateClientToken(),
+		InstanceChargeType: d.InstanceChargeType,
+		Period:             d.Period,
+		PeriodUnit:         d.PeriodUnit,
+		SpotStrategy:       d.SpotStrategy,
+		SpotPriceLimit:     spotPriceLimit,
+		SpotDuration:       &d.SpotDuration,
 	}
 
 	if d.SystemDiskCategory != "" {
