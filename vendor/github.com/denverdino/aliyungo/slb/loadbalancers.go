@@ -40,19 +40,29 @@ const (
 	S3Large  = "slb.s3.large"
 )
 
+type ModificationProtectionType string
+
+const (
+	NonProtection     = ModificationProtectionType("NonProtection")
+	ConsoleProtection = ModificationProtectionType("ConsoleProtection")
+)
+
 type CreateLoadBalancerArgs struct {
-	RegionId           common.Region
-	LoadBalancerName   string
-	AddressType        AddressType
-	VSwitchId          string
-	InternetChargeType InternetChargeType
-	Bandwidth          int
-	ClientToken        string
-	MasterZoneId       string
-	SlaveZoneId        string
-	LoadBalancerSpec   LoadBalancerSpecType
-	AddressIPVersion   AddressIPVersionType
-	DeleteProtection   FlagType
+	RegionId                     common.Region
+	LoadBalancerName             string
+	AddressType                  AddressType
+	VSwitchId                    string
+	InternetChargeType           InternetChargeType
+	Bandwidth                    int
+	ClientToken                  string
+	MasterZoneId                 string
+	SlaveZoneId                  string
+	LoadBalancerSpec             LoadBalancerSpecType
+	AddressIPVersion             AddressIPVersionType
+	DeleteProtection             FlagType
+	ModificationProtectionStatus ModificationProtectionType
+	ModificationProtectionReason string
+	ResourceGroupId              string
 }
 
 type CreateLoadBalancerResponse struct {
@@ -214,23 +224,34 @@ type BackendServerType struct {
 	Type     string
 }
 
+type ServiceManagedModeType string
+
+const (
+	Managed           = ServiceManagedModeType("Managed")
+	Unmanaged         = ServiceManagedModeType("Unmanaged")
+	DependencyManaged = ServiceManagedModeType("DependencyManaged")
+)
+
 type LoadBalancerType struct {
-	LoadBalancerId     string
-	LoadBalancerName   string
-	LoadBalancerStatus string
-	Address            string
-	RegionId           common.Region
-	RegionIdAlias      string
-	AddressType        AddressType
-	VSwitchId          string
-	VpcId              string
-	NetworkType        string
-	Bandwidth          int
-	InternetChargeType InternetChargeType
-	CreateTime         string //Why not ISO 6801
-	CreateTimeStamp    util.ISO6801Time
-	DeleteProtection   FlagType
-	ListenerPorts      struct {
+	LoadBalancerId               string
+	ResourceGroupId              string
+	LoadBalancerName             string
+	LoadBalancerStatus           string
+	Address                      string
+	RegionId                     common.Region
+	RegionIdAlias                string
+	AddressType                  AddressType
+	VSwitchId                    string
+	VpcId                        string
+	NetworkType                  string
+	Bandwidth                    int
+	InternetChargeType           InternetChargeType
+	CreateTime                   string //Why not ISO 6801
+	CreateTimeStamp              util.ISO6801Time
+	DeleteProtection             FlagType
+	ModificationProtectionStatus ModificationProtectionType
+	ModificationProtectionReason string
+	ListenerPorts                struct {
 		ListenerPort []int
 	}
 	ListenerPortsAndProtocol struct {
@@ -239,10 +260,11 @@ type LoadBalancerType struct {
 	BackendServers struct {
 		BackendServer []BackendServerType
 	}
-	LoadBalancerSpec LoadBalancerSpecType
-	MasterZoneId     string
-	SlaveZoneId      string
-	AddressIPVersion AddressIPVersionType
+	LoadBalancerSpec   LoadBalancerSpecType
+	MasterZoneId       string
+	SlaveZoneId        string
+	AddressIPVersion   AddressIPVersionType
+	ServiceManagedMode ServiceManagedModeType
 }
 
 type DescribeLoadBalancersResponse struct {
@@ -355,5 +377,62 @@ type SetLoadBalancerDeleteProtectionResponse struct {
 func (client *Client) SetLoadBalancerDeleteProtection(args *SetLoadBalancerDeleteProtectionArgs) (err error) {
 	response := &SetLoadBalancerDeleteProtectionResponse{}
 	err = client.Invoke("SetLoadBalancerDeleteProtection", args, response)
+	return err
+}
+
+type SetLoadBalancerModificationProtectionArgs struct {
+	RegionId                     common.Region
+	LoadBalancerId               string
+	ModificationProtectionStatus ModificationProtectionType
+	ModificationProtectionReason string
+}
+
+type SetLoadBalancerModificationProtectionResponse struct {
+	common.Response
+}
+
+func (client *Client) SetLoadBalancerModificationProtection(args *SetLoadBalancerModificationProtectionArgs) (err error) {
+	response := &SetLoadBalancerModificationProtectionResponse{}
+	err = client.Invoke("SetLoadBalancerModificationProtection", args, response)
+	return err
+}
+
+type ManagedResourceType string
+
+const (
+	ManagedLoadBalancer           = ManagedResourceType("LoadBalancer")
+	ManagedTls                    = ManagedResourceType("Tls")
+	ManagedVServerGroup           = ManagedResourceType("VServerGroup")
+	ManagedMasterSlaveServerGroup = ManagedResourceType("MasterSlaveServerGroup")
+	ManagedAcl                    = ManagedResourceType("Acl")
+	ManagedListener               = ManagedResourceType("Listener")
+	ManagedRule                   = ManagedResourceType("Rule")
+	ManagedAppRule                = ManagedResourceType("AppRule")
+	ManagedDomainExtension        = ManagedResourceType("DomainExtension")
+)
+
+type ManagedResourceModel struct {
+	ResourceId string
+	Port       int
+	Protocol   string
+}
+
+type ServiceManagedControlArgs struct {
+	RegionId           common.Region
+	ServiceManagedMode ServiceManagedModeType
+	ResourceUid        string
+	ResourceBid        string
+	ResourceType       ManagedResourceType
+	Resources          []ManagedResourceModel
+}
+
+type ServiceManagedControlResponse struct {
+	common.Response
+}
+
+//api: https://yuque.antfin-inc.com/docs/share/63b5a2d3-6fb3-4bd7-a50e-c4b385b866fd?#
+func (client *Client) ServiceManagedControl(args *ServiceManagedControlArgs) (err error) {
+	response := &ServiceManagedControlResponse{}
+	err = client.Invoke("ServiceManagedControl", args, response)
 	return err
 }
