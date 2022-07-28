@@ -292,7 +292,7 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "SPOT_STRATEGY",
 		},
 		mcnflag.StringFlag{
-			Name:   "aliyunecs-spot-priceLimit",
+			Name:   "aliyunecs-spot-price-limit",
 			Usage:  "Set the maximum price per hour for the instance",
 			Value:  "",
 			EnvVar: "SPOT_PRICELIMIT",
@@ -397,7 +397,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.Period = flags.Int("aliyunecs-period")
 	d.PeriodUnit = common.TimeType(flags.String("aliyunecs-period-unit"))
 	d.SpotStrategy = ecs.SpotStrategyType(flags.String("aliyunecs-spot-strategy"))
-	d.SpotPriceLimit = flags.String("aliyunecs-spot-priceLimit")
+	d.SpotPriceLimit = flags.String("aliyunecs-spot-price-limit")
 	d.SpotDuration = flags.Int("aliyunecs-spot-duration")
 
 	tagMap := make(map[string]string)
