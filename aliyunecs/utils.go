@@ -3,6 +3,7 @@ package aliyunecs
 import (
 	"crypto/rand"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/denverdino/aliyungo/common"
@@ -58,4 +59,21 @@ func randomPassword() string {
 
 func isUbuntuImage(image string) bool {
 	return strings.HasPrefix(image, "ubuntu")
+}
+
+func SplitPortProto(raw string) (port int, protocol string, err error) {
+	parts := strings.SplitN(raw, "/", 2)
+	out, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 22, "tcp", err
+	}
+	if len(parts) == 1 {
+		return out, "tcp", nil
+	}
+	if parts[1] != "tcp" && parts[1] != "udp" && parts[1] != "all" && parts[1] != "icmp" && parts[1] != "gre" {
+		// If the format passed in does not match the ecs communication protocol then the default is tcp
+		return out, "tcp", nil
+	}
+
+	return out, parts[1], nil
 }
