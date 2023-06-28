@@ -3,10 +3,10 @@ package aliyunecs
 import (
 	"crypto/rand"
 	"errors"
+	mrand "math/rand"
 	"strconv"
 	"strings"
-
-	"github.com/denverdino/aliyungo/common"
+	"time"
 )
 
 var (
@@ -20,9 +20,9 @@ var (
 const defaultUbuntuImageID = "ubuntu_16_0402_64_20G_alibase_20171227.vhd"
 const defaultUbuntuImagePrefix = "ubuntu_16_0402_64"
 
-func validateECSRegion(region string) (common.Region, error) {
-	for _, v := range common.ValidRegions {
-		if v == common.Region(region) {
+func validateECSRegion(region string) (Region, error) {
+	for _, v := range validRegions {
+		if v == Region(region) {
 			return v, nil
 		}
 	}
@@ -34,6 +34,7 @@ const digitals = "0123456789"
 const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const specialChars = "()`~!@#$%^&*-+=|{}[]:;'<>,.?/"
 const dictionary = digitals + alphabet + specialChars
+const tokenDictionary = "_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const paswordLen = 16
 
 func randomPassword() string {
@@ -76,4 +77,56 @@ func SplitPortProto(raw string) (port int, protocol string, err error) {
 	}
 
 	return out, parts[1], nil
+}
+
+// A PaginationResponse represents a response with pagination information
+type PaginationResult struct {
+	TotalCount int
+	PageNumber int
+	PageSize   int
+}
+
+type Pagination struct {
+	PageNumber int
+	PageSize   int
+}
+
+// NextPage gets the next page of the result set
+func (r *PaginationResult) NextPage() *Pagination {
+	if r.PageNumber*r.PageSize >= r.TotalCount {
+		return nil
+	}
+	return &Pagination{PageNumber: r.PageNumber + 1, PageSize: r.PageSize}
+}
+
+var validRegions = []Region{
+	Hangzhou, Qingdao, Beijing, Shenzhen, Hongkong, Shanghai, Zhangjiakou, Huhehaote,
+	USWest1, USEast1,
+	APNorthEast1, APSouthEast1, APSouthEast2, APSouthEast3, APSouthEast5,
+	APSouth1,
+	MEEast1,
+	EUCentral1, EUWest1,
+	ShenZhenFinance, ShanghaiFinance,
+}
+
+// CreateRandomString create random string
+func CreateRandomString() string {
+	b := make([]byte, 32)
+	l := len(tokenDictionary)
+
+	_, err := rand.Read(b)
+
+	if err != nil {
+		// fail back to insecure rand
+		mrand.Seed(time.Now().UnixNano())
+		for i := range b {
+			b[i] = tokenDictionary[mrand.Int()%l]
+		}
+	} else {
+		for i, v := range b {
+			b[i] = dictionary[v%byte(l)]
+		}
+	}
+
+	return string(b)
 }
