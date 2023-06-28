@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/denverdino/aliyungo/ecs"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 )
 
 const (
@@ -167,14 +167,14 @@ func TestGetPrivateIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var instance ecs.InstanceAttributesType
+	var instance ecs.DescribeInstanceAttributeResponse
 	instance.InnerIpAddress.IpAddress = []string{"192.168.1.100"}
 
 	if d.GetPrivateIP(&instance) != "192.168.1.100" {
 		t.Error("getPrivateIP failed")
 	}
 
-	var instance2 ecs.InstanceAttributesType
+	var instance2 ecs.DescribeInstanceAttributeResponse
 	instance2.VpcAttributes.PrivateIpAddress.IpAddress = []string{"172.168.1.100"}
 
 	if d.GetPrivateIP(&instance2) != "172.168.1.100" {
@@ -189,14 +189,14 @@ func TestGetIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var instance ecs.InstanceAttributesType
+	var instance ecs.DescribeInstanceAttributeResponse
 	instance.InnerIpAddress.IpAddress = []string{"192.168.1.100"}
 	instance.PublicIpAddress.IpAddress = []string{"42.120.158.67"}
 	if d.getIP(&instance) != "42.120.158.67" {
 		t.Error("getIP failed")
 	}
 
-	var instance2 ecs.InstanceAttributesType
+	var instance2 ecs.DescribeInstanceAttributeResponse
 	instance2.InnerIpAddress.IpAddress = []string{"192.168.1.100"}
 	instance2.EipAddress.IpAddress = "42.120.158.67"
 	if d.getIP(&instance2) != "42.120.158.67" {

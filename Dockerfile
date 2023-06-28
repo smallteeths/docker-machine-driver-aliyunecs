@@ -1,6 +1,5 @@
 
-FROM golang:1.13.7
-MAINTAINER denverdino@gmail.com
+FROM golang:1.19
 
 ENV OS "darwin linux windows"
 ENV ARCH "amd64"
@@ -11,7 +10,7 @@ RUN set -ex \
 	&& uname -a \
 	&& go version \
 	&& go env \
-    && go get ./... \
+    && go mod tidy \
     && go vet ./...
 RUN dmver=v0.13.0 \
     && echo "VERSION docker-machine '$dmver'"

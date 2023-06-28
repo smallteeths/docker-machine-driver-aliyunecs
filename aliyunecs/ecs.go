@@ -3,6 +3,7 @@ package aliyunecs
 import (
 	"crypto/md5"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,33 +14,44 @@ import (
 	"strings"
 	"time"
 
-	"github.com/denverdino/aliyungo/common"
-	"github.com/denverdino/aliyungo/ecs"
-	"github.com/denverdino/aliyungo/slb"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/slb"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/vpc"
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnflag"
 	"github.com/docker/machine/libmachine/mcnutils"
 	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
-	//"os"
+	"github.com/pkg/errors"
 )
 
 const (
-	driverName               = "aliyunecs"
-	defaultRegion            = "cn-hangzhou"
-	defaultInstanceType      = "ecs.n4.small"
-	defaultRootSize          = 20
-	internetChargeType       = string(common.PayByBandwidth)
-	ipRange                  = "0.0.0.0/0"
-	machineSecurityGroupName = "rancher-machine"
-	vpcCidrBlock             = "10.0.0.0/8"
-	vSwitchCidrBlock         = "10.1.0.0/24"
-	timeout                  = 300
-	sshTimeout               = 60
-	defaultInterval          = 5
-	defaultSSHUser           = "root"
-	maxRetry                 = 20
+	driverName             = "aliyunecs"
+	defaultRegion          = "cn-hangzhou"
+	defaultInstanceType    = "ecs.n4.small"
+	internetChargeType     = "PayByBandwidth"
+	running                = "Running"
+	stopped                = "Stopped"
+	pending                = "Pending"
+	starting               = "Starting"
+	stopping               = "Stopping"
+	deleted                = "Deleted"
+	eipStatusInUse         = "InUse"
+	eipStatusAvailable     = "Available"
+	https                  = "https"
+	defaultTimeout         = 60
+	defaultWaitForInterval = 5
+	instanceDefaultTimeout = 120
+	ipRange                = "0.0.0.0/0"
+	defaultSSHUser         = "root"
+	timeout                = 300
+	maxRetry               = 20
+	sshTimeout             = 60
+	defaultInterval        = 5
 )
 
 var (
@@ -52,7 +64,7 @@ type Driver struct {
 	Id                      string
 	AccessKey               string
 	SecretKey               string
-	Region                  common.Region
+	Region                  string
 	ImageID                 string
 	SSHPassword             string
 	SSHKeyPairName          string
@@ -69,29 +81,30 @@ type Driver struct {
 	Zone                    string
 	PrivateIPOnly           bool
 	InternetMaxBandwidthOut int
-	InternetChargeType      common.InternetChargeType
+	InternetChargeType      string
 	RouteCIDR               string
 	SLBID                   string
 	SLBIPAddress            string
 	Tags                    map[string]string
 	DiskSize                int
 	DiskFS                  string
-	DiskCategory            ecs.DiskCategory
+	DiskCategory            string
 	Description             string
 	APIEndpoint             string
-	SystemDiskCategory      ecs.DiskCategory
+	SystemDiskCategory      string
 	SystemDiskSize          int
 	ResourceGroupId         string
 	// PANDARIA
-	InstanceChargeType common.InstanceChargeType
+	InstanceChargeType string
 	Period             int
-	PeriodUnit         common.TimeType
-	SpotStrategy       ecs.SpotStrategyType
+	PeriodUnit         string
+	SpotStrategy       string
 	SpotPriceLimit     string
 	SpotDuration       int
 	OpenPorts          []string
 
 	client    *ecs.Client
+	vpcClient *vpc.Client
 	slbClient *slb.Client
 }
 
@@ -318,50 +331,37 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		}}
 }
 
-func (d *Driver) GetImageID(image string) string {
-
-	if len(image) != 0 {
-		return image
+func (d *Driver) GetState() (state.State, error) {
+	inst, err := d.getInstance()
+	if err != nil {
+		return state.Error, err
 	}
-	args := ecs.DescribeImagesArgs{
-		RegionId:        d.Region,
-		ImageOwnerAlias: ecs.ImageOwnerSystem,
+	switch inst.Status {
+	case starting:
+		return state.Starting, nil
+	case running:
+		return state.Running, nil
+	case stopping:
+		return state.Stopping, nil
+	case stopped:
+		return state.Stopped, nil
+	default:
+		return state.Error, nil
 	}
+}
 
-	// Scan registed images with prefix of default Ubuntu image
-	for {
-		images, pagination, err := d.getClient().DescribeImages(&args)
-		if err != nil {
-			log.Errorf("%s | Failed to describe images: %v", d.MachineName, err)
-			break
-		} else {
-			for _, image := range images {
-				if strings.HasPrefix(image.ImageId, defaultUbuntuImagePrefix) {
-					return image.ImageId
-				}
-			}
-			nextPage := pagination.NextPage()
-			if nextPage == nil {
-				break
-			}
-			args.Pagination = *nextPage
-		}
-	}
-
-	//Use default image
-	image = defaultUbuntuImageID
-
-	return image
+func (d *Driver) GetSSHHostname() (string, error) {
+	return d.GetIP()
 }
 
 func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	d.APIEndpoint = flags.String("aliyunecs-api-endpoint")
-	var region common.Region
+	var region Region
 	var err error
+	d.APIEndpoint = flags.String("aliyunecs-api-endpoint")
 	regionId := flags.String("aliyunecs-region")
 	if d.APIEndpoint != "" {
 		// Ignore the Region validation
-		region = common.Region(regionId)
+		region = Region(regionId)
 	} else {
 		region, err = validateECSRegion(flags.String("aliyunecs-region"))
 		if err != nil {
@@ -370,7 +370,7 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	}
 	d.AccessKey = flags.String("aliyunecs-access-key-id")
 	d.SecretKey = flags.String("aliyunecs-access-key-secret")
-	d.Region = region
+	d.Region = string(region)
 	d.ImageID = flags.String("aliyunecs-image-id")
 	d.InstanceType = flags.String("aliyunecs-instance-type")
 	d.VpcId = flags.String("aliyunecs-vpc-id")
@@ -387,27 +387,25 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SSHPort = 22
 	d.PrivateIPOnly = flags.Bool("aliyunecs-private-address-only")
 	d.InternetMaxBandwidthOut = flags.Int("aliyunecs-internet-max-bandwidth")
-	d.InternetChargeType = common.InternetChargeType(flags.String("aliyunecs-internet-charge-type"))
+	d.InternetChargeType = flags.String("aliyunecs-internet-charge-type")
 	d.RouteCIDR = flags.String("aliyunecs-route-cidr")
 	d.SLBID = flags.String("aliyunecs-slb-id")
 	d.DiskSize = flags.Int("aliyunecs-disk-size")
 	d.DiskFS = flags.String("aliyunecs-disk-fs")
-	d.DiskCategory = ecs.DiskCategory(flags.String("aliyunecs-disk-category"))
+	d.DiskCategory = flags.String("aliyunecs-disk-category")
 	tags := flags.StringSlice("aliyunecs-tag")
-
 	d.Description = flags.String("aliyunecs-description")
-	d.SystemDiskCategory = ecs.DiskCategory(flags.String("aliyunecs-system-disk-category"))
+	d.SystemDiskCategory = flags.String("aliyunecs-system-disk-category")
 	d.SystemDiskSize = flags.Int("aliyunecs-system-disk-size")
 	d.ResourceGroupId = flags.String("aliyunecs-resource-group-id")
 	// PANDARIA
-	d.InstanceChargeType = common.InstanceChargeType(flags.String("aliyunecs-instance-charge-type"))
+	d.InstanceChargeType = flags.String("aliyunecs-instance-charge-type")
 	d.Period = flags.Int("aliyunecs-period")
-	d.PeriodUnit = common.TimeType(flags.String("aliyunecs-period-unit"))
-	d.SpotStrategy = ecs.SpotStrategyType(flags.String("aliyunecs-spot-strategy"))
+	d.PeriodUnit = flags.String("aliyunecs-period-unit")
+	d.SpotStrategy = flags.String("aliyunecs-spot-strategy")
 	d.SpotPriceLimit = flags.String("aliyunecs-spot-price-limit")
 	d.SpotDuration = flags.Int("aliyunecs-spot-duration")
 	d.OpenPorts = flags.StringSlice("aliyunecs-open-port")
-
 	tagMap := make(map[string]string)
 	if len(tags) > 0 {
 		for _, tag := range tags {
@@ -421,81 +419,63 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 			tagMap[k] = v
 		}
 	}
-
 	if len(tagMap) > 0 {
 		d.Tags = tagMap
 	}
-
 	if d.RouteCIDR != "" {
-		_, _, err := net.ParseCIDR(d.RouteCIDR)
-		if err != nil {
+		if _, _, err := net.ParseCIDR(d.RouteCIDR); err != nil {
 			return fmt.Errorf("%s | Invalid CIDR value for --aliyunecs-route-cidr", d.MachineName)
 		}
 	}
-
 	if d.InternetMaxBandwidthOut < 0 || d.InternetMaxBandwidthOut > 200 {
 		return fmt.Errorf("%s | aliyunecs driver --aliyunecs-internet-max-bandwidth: The value should be in 1 ~ 200", d.MachineName)
 	}
-
 	if !d.PrivateIPOnly && d.InternetMaxBandwidthOut == 0 {
 		d.InternetMaxBandwidthOut = 1
 	}
-
 	if !d.PrivateIPOnly && d.InternetMaxBandwidthOut == 0 {
 		d.InternetMaxBandwidthOut = 1
 	}
-
-	if d.InternetChargeType != common.PayByTraffic && d.InternetChargeType != common.PayByBandwidth {
+	if d.InternetChargeType != "PayByTraffic" && d.InternetChargeType != "PayByBandwidth" {
 		return fmt.Errorf("Unsupported internet charge type: %s", d.InternetChargeType)
 	}
-
 	if d.AccessKey == "" {
 		return fmt.Errorf("%s | aliyunecs driver requires the --aliyunecs-access-key-id option", d.MachineName)
 	}
-
 	if d.SecretKey == "" {
 		return fmt.Errorf("%s | aliyunecs driver requires the --aliyunecs-access-key-secret option", d.MachineName)
 	}
-
 	//VpcId and VSwitchId are optional or required together
 	if (d.VpcId == "" && d.VSwitchId != "") || (d.VpcId != "" && d.VSwitchId == "") {
 		return fmt.Errorf("%s | aliyunecs driver requires both the --aliyunecs-vpc-id and --aliyunecs-vswitch-id for Virtual Private Cloud", d.MachineName)
 	}
-
 	if d.isSwarmMaster() {
 		u, err := url.Parse(d.SwarmHost)
 		if err != nil {
 			return fmt.Errorf("error parsing swarm host: %s", err)
 		}
-
 		parts := strings.Split(u.Host, ":")
 		port, err := strconv.Atoi(parts[1])
 		if err != nil {
 			return err
 		}
-
 		swarmPort = port
 	}
-
 	if d.APIEndpoint != "" {
 		if d.SLBID != "" {
 			return fmt.Errorf("Unsupport 'aliyunecs-slb-id' flag when the custom API endpoint is specified")
 		}
 	}
-
 	if d.DiskFS != "xfs" && d.DiskFS != "ext4" {
 		return fmt.Errorf("Unsupport file system for data disk: %s", d.DiskFS)
 	}
-
 	if d.SSHPrivateKeyPath == "" && d.SSHKeyPairName != "" {
 		return fmt.Errorf("using --aliyunecs-keypair-name also requires --aliyunecs-ssh-keypath")
 	}
-
 	// Pandaria
 	if d.InstanceChargeType == "PrePaid" && d.Period == 0 {
 		return fmt.Errorf("using --instance-charge-type=PrePaid aslo requires --Period")
 	}
-
 	return nil
 }
 
@@ -503,54 +483,37 @@ func (d *Driver) DriverName() string {
 	return driverName
 }
 
-func (d *Driver) checkPrereqs() error {
-
-	if d.SLBID != "" {
-		loadBalancer, err := d.getSLBClient().DescribeLoadBalancerAttribute(d.SLBID)
-		if err != nil {
-			return fmt.Errorf("%s | Invalid --aliyunecs-slb-id: %v", d.MachineName, err)
-		}
-		d.SLBIPAddress = loadBalancer.Address
-	}
-	return nil
-}
-
-func (d *Driver) PreCreateCheck() error {
-	return d.checkPrereqs()
-}
-
 func (d *Driver) Create() error {
-
 	var (
 		err error
 	)
 	VpcId := d.VpcId
 	VSwitchId := d.VSwitchId
-
+	ecsClient, err := d.getClient()
+	if err != nil {
+		return err
+	}
+	if _, err = d.getVpcClient(); err != nil {
+		return err
+	}
 	if err := d.checkPrereqs(); err != nil {
 		return err
 	}
-
 	log.Infof("%s | Creating key pair for instance ...", d.MachineName)
-
 	if err := d.createKeyPair(); err != nil {
 		return fmt.Errorf("%s | Failed to create key pair: %v", d.MachineName, err)
 	}
-
 	log.Infof("%s | Configuring security groups instance ...", d.MachineName)
-	if err := d.configureSecurityGroup(VpcId, d.SecurityGroupName, d.OpenPorts); err != nil {
+	if err := d.configureSecurityGroup(ecsClient, VpcId, d.SecurityGroupName, d.OpenPorts); err != nil {
 		return err
 	}
-
 	// Create random password if no input
 	if d.SSHPassword == "" && d.SSHKeyPairName == "" {
 		d.SSHPassword = randomPassword()
 		log.Infof("%s | Launching instance with generated password, please update password in console or log in with ssh key.", d.MachineName)
 	}
-
-	imageID := d.GetImageID(d.ImageID)
+	imageID := d.getImageID(ecsClient, d.ImageID)
 	log.Infof("%s | Creating instance with image %s ...", d.MachineName, imageID)
-
 	// Pandaria
 	var spotPriceLimit float64
 	if d.InstanceChargeType == "PostPaid" && d.SpotStrategy == "SpotWithPriceLimit" && d.SpotPriceLimit != "" {
@@ -559,99 +522,75 @@ func (d *Driver) Create() error {
 			return fmt.Errorf("%s | SpotPriceLimit failed to parse float: %v", d.MachineName, err)
 		}
 	}
-
-	args := ecs.CreateInstanceArgs{
-		RegionId:           d.Region,
-		InstanceName:       d.GetMachineName(),
-		Description:        d.Description,
-		ImageId:            imageID,
-		InstanceType:       d.InstanceType,
-		SecurityGroupId:    d.SecurityGroupId,
-		InternetChargeType: d.InternetChargeType,
-		Password:           d.SSHPassword,
-		KeyPairName:        d.SSHKeyPairName,
-		VSwitchId:          VSwitchId,
-		ZoneId:             d.Zone,
-		ClientToken:        d.getClient().GenerateClientToken(),
-		InstanceChargeType: d.InstanceChargeType,
-		Period:             d.Period,
-		PeriodUnit:         d.PeriodUnit,
-		SpotStrategy:       d.SpotStrategy,
-		SpotPriceLimit:     spotPriceLimit,
-		SpotDuration:       &d.SpotDuration,
-	}
-
+	request := ecs.CreateCreateInstanceRequest()
+	request.RegionId = d.Region
+	request.InstanceName = d.GetMachineName()
+	request.Description = d.Description
+	request.ImageId = imageID
+	request.InstanceType = d.InstanceType
+	request.Password = d.SSHPassword
+	request.KeyPairName = d.SSHKeyPairName
+	request.VSwitchId = VSwitchId
+	request.ZoneId = d.Zone
+	request.ClientToken = CreateRandomString()
+	request.InstanceChargeType = d.InstanceChargeType
+	request.Period = requests.NewInteger(d.Period)
+	request.PeriodUnit = d.PeriodUnit
+	request.SpotStrategy = d.SpotStrategy
+	request.SpotPriceLimit = requests.NewFloat(spotPriceLimit)
+	request.SpotDuration = requests.NewInteger(d.SpotDuration)
+	request.SecurityGroupId = d.SecurityGroupId
 	if d.SystemDiskCategory != "" {
-		args.SystemDisk.Category = d.SystemDiskCategory
+		request.SystemDiskCategory = d.SystemDiskCategory
 	}
-
 	if d.SystemDiskSize > 0 {
-		args.SystemDisk.Size = d.SystemDiskSize
+		request.SystemDiskSize = requests.NewInteger(d.SystemDiskSize)
 	}
-
 	if d.DiskSize > 0 { // Allocate Data Disk
-
-		disk := ecs.DataDiskType{
+		disk := ecs.CreateInstanceDataDisk{
 			DiskName:           d.MachineName + "_data",
 			Description:        "Data volume for Docker",
-			Size:               d.DiskSize,
+			Size:               strconv.Itoa(d.DiskSize),
 			Category:           d.DiskCategory,
 			Device:             "/dev/xvdb",
-			DeleteWithInstance: true,
+			DeleteWithInstance: "true",
 		}
-
-		args.DataDisk = []ecs.DataDiskType{disk}
-
+		request.DataDisk = &[]ecs.CreateInstanceDataDisk{disk}
 	}
-
 	// Create instance
-	instanceId, err := d.getClient().CreateInstance(&args)
-
+	response, err := ecsClient.CreateInstance(request)
 	if err != nil {
-		err = fmt.Errorf("%s | Failed to create instance: %s", d.MachineName, err)
-		log.Error(err)
+		log.Debugf("Failed to create instance: %+v ...", err)
+		err = fmt.Errorf("%s | Failed to create instance: %+v", d.MachineName, err)
 		return err
 	}
-	log.Infof("%s | Create instance %s successfully", d.MachineName, instanceId)
-
-	d.InstanceId = instanceId
-
+	log.Infof("%s | Create instance %s successfully", d.MachineName, response.InstanceId)
+	d.InstanceId = response.InstanceId
 	// Wait for creation successfully
-	err = d.getClient().WaitForInstance(instanceId, ecs.Stopped, timeout)
-
-	if err != nil {
+	if err = d.waitForInstance(d.InstanceId, stopped, timeout); err != nil {
 		err = fmt.Errorf("%s | Failed to wait instance to 'stopped': %s", d.MachineName, err)
-		log.Error(err)
 	}
-
-	if err == nil {
-		err = d.configNetwork(VpcId, instanceId)
+	if err = d.configNetwork(VpcId, d.InstanceId); err != nil {
+		err = fmt.Errorf("%s | Failed to config net work: %s", d.MachineName, err)
 	}
-
 	if err == nil {
 		// Start instance
-		log.Infof("%s | Starting instance %s ...", d.MachineName, instanceId)
-		err = d.getClient().StartInstance(instanceId)
+		log.Infof("%s | Starting instance %s ...", d.MachineName, d.InstanceId)
+		err := d.startInstance()
 		if err == nil {
 			// Wait for running
-			err = d.getClient().WaitForInstance(instanceId, ecs.Running, timeout)
-
+			err = d.waitForInstance(d.InstanceId, running, timeout)
 			if err == nil {
-				log.Infof("%s | Start instance %s successfully", d.MachineName, instanceId)
+				log.Infof("%s | Start instance %s successfully", d.MachineName, d.InstanceId)
 				instance, err := d.getInstance()
-
 				if err == nil {
 					d.Zone = instance.ZoneId
 					d.PrivateIPAddress = d.GetPrivateIP(instance)
-
 					d.IPAddress = d.getIP(instance)
-
 					ssh.SetDefaultClient(ssh.Native)
-
 					if configInstanceErr := d.configECSInstance(imageID); configInstanceErr != nil {
 						return configInstanceErr
 					}
-
 					log.Infof("%s | Created instance %s successfully with public IP address %s and private IP address %s",
 						d.MachineName,
 						d.InstanceId,
@@ -663,220 +602,125 @@ func (d *Driver) Create() error {
 				err = fmt.Errorf("%s | Failed to wait instance to running state: %s", d.MachineName, err)
 			}
 		} else {
-			err = fmt.Errorf("%s | Failed to start instance %s: %v", d.MachineName, instanceId, err)
+			err = fmt.Errorf("%s | Failed to start instance %s: %v", d.MachineName, d.InstanceId, err)
 		}
 	}
-
 	// Add instance tags
 	if len(d.Tags) > 0 {
-		log.Infof("%s | Adding tags %v to instance %s ...", d.MachineName, d.Tags, instanceId)
-		args := ecs.AddTagsArgs{
-			RegionId:     d.Region,
-			ResourceId:   instanceId,
-			ResourceType: ecs.TagResourceInstance,
-			Tag:          d.Tags,
-		}
-		err2 := d.getClient().AddTags(&args)
+		log.Infof("%s | Adding tags %v to instance %s ...", d.MachineName, d.Tags, d.InstanceId)
+		err2 := d.addTags()
 		if err2 != nil {
-			log.Warnf("%s | Failed to add tags %v to instance %s: %v", d.MachineName, d.Tags, instanceId, err)
+			log.Warnf("%s | Failed to add tags %v to instance %s: %v", d.MachineName, d.Tags, d.InstanceId, err)
 		}
 	}
-
 	return err
 }
 
-func (d *Driver) configNetwork(vpcId string, instanceId string) error {
-	var err error
-	if vpcId == "" {
-		// Assign public IP if not private IP only
+func (d *Driver) Start() error {
+	if err := d.startInstance(); err != nil {
+		log.Errorf("%s | Failed to start instance %s: %v", d.MachineName, d.InstanceId, err)
+		return err
+	}
+	// Wait for running
+	if err := d.waitForInstance(d.InstanceId, running, timeout); err != nil {
+		log.Errorf("%s | Failed to wait instance %s running: %v", d.MachineName, d.InstanceId, err)
+		return err
+	}
+	return nil
+}
 
-		if !d.PrivateIPOnly {
-			// Allocate public IP address for classic network
-			var ipAddress string
-			ipAddress, err = d.getClient().AllocatePublicIpAddress(instanceId)
-			if err != nil {
-				err = fmt.Errorf("%s | Error allocate public IP address for instance %s: %v", d.MachineName, instanceId, err)
-			} else {
-				log.Infof("%s | Allocate publice IP address %s for instance %s successfully", d.MachineName, ipAddress, instanceId)
-			}
+func (d *Driver) Stop() error {
+	if err := d.stopInstance(false); err != nil {
+		log.Errorf("%s | Failed to stop instance %s: %v", d.MachineName, d.InstanceId, err)
+		return err
+	}
+	// Wait for stopped
+	if err := d.waitForInstance(d.InstanceId, stopped, timeout); err != nil {
+		log.Errorf("%s | Failed to wait instance %s stopped: %v", d.MachineName, d.InstanceId, err)
+		return err
+	}
+	return nil
+}
+
+func (d *Driver) Remove() error {
+	log.Infof("%s | Remove instance %s ...", d.MachineName, d.InstanceId)
+	if d.InstanceId == "" {
+		return fmt.Errorf("%s | Unknown instance id", d.MachineName)
+	}
+	s, err := d.GetState()
+	if err == nil && s == state.Running {
+		if err := d.Stop(); err != nil {
+			log.Infof("%s | Unable to removed the instance %s: %s", d.MachineName, d.InstanceId, err)
 		}
+	}
+	instance, err := d.getInstance()
+	if err != nil {
+		return fmt.Errorf("%s | Unable to describe the instance %s: %s", d.MachineName, d.InstanceId, err)
 	} else {
-		err := d.addRouteEntry(vpcId)
-		if err != nil {
-			return err
+		// Check and release EIP if exists
+		if instance.EipAddress.AllocationId != "" {
+			allocationId := instance.EipAddress.AllocationId
+			if err = d.unassociateEipAddress(allocationId, instance.InstanceId); err != nil {
+				log.Errorf("%s | Failed to unassociate EIP address from instance %s: %v", d.MachineName, d.InstanceId, err)
+			}
+			if err = d.waitForEip(instance.RegionId, allocationId, eipStatusAvailable, 0); err != nil {
+				return fmt.Errorf("%s | Failed to wait EIP %s available: %v", d.MachineName, allocationId, err)
+			}
+			if err = d.releaseEipAddress(allocationId); err != nil {
+				log.Errorf("%s | Failed to release EIP address: %v", d.MachineName, err)
+			}
 		}
-		if !d.PrivateIPOnly {
-			// Create EIP for virtual private cloud
-			eipArgs := ecs.AllocateEipAddressArgs{
-				RegionId:           d.Region,
-				Bandwidth:          d.InternetMaxBandwidthOut,
-				InternetChargeType: d.InternetChargeType,
-				ClientToken:        d.getClient().GenerateClientToken(),
-			}
-			log.Infof("%s | Allocating Eip address for instance %s ...", d.MachineName, instanceId)
-
-			_, allocationId, err := d.getClient().AllocateEipAddress(&eipArgs)
-			if err != nil {
-				return fmt.Errorf("%s | Failed to allocate EIP address: %v", d.MachineName, err)
-			}
-			err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusAvailable, 60)
-			if err != nil {
-				log.Infof("%s | Releasing Eip address %s for ...", d.MachineName, allocationId)
-				err2 := d.getClient().ReleaseEipAddress(allocationId)
-				if err2 != nil {
-					log.Warnf("%s | Failed to release EIP address: %v", d.MachineName, err2)
-				}
-				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
-			}
-			log.Infof("%s | Associating Eip address %s for instance %s ...", d.MachineName, allocationId, instanceId)
-			err = d.getClient().AssociateEipAddress(allocationId, instanceId)
-			if err != nil {
-				return fmt.Errorf("%s | Failed to associate EIP address: %v", d.MachineName, err)
-			}
-			err = d.getClient().WaitForEip(d.Region, allocationId, ecs.EipStatusInUse, 60)
-			if err != nil {
-				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+		log.Debugf("%s | instance.VpcAttributes: %++v\n", d.MachineName, instance.VpcAttributes)
+		vpcId := instance.VpcAttributes.VpcId
+		if vpcId != "" {
+			// Remove route entry firstly
+			if err = d.removeRouteEntry(vpcId, instance.InstanceId); err != nil {
+				log.Error("%s | remove routeEntry: %++v\n", d.MachineName, err)
 			}
 		}
 	}
-
-	if d.SLBID != "" { // Add the instance to SLB
-		log.Infof("%s | Adding instance %s to SLB %s ...", d.MachineName, instanceId, d.SLBID)
-		count := 0
-		for {
-			backendServers := []slb.BackendServerType{
-				slb.BackendServerType{
-					ServerId: instanceId,
-					Weight:   100,
-				},
-			}
-			_, err = d.getSLBClient().AddBackendServers(d.SLBID, backendServers)
-			if err != nil {
-				log.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
-				count++
-				if count <= maxRetry {
-					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
-					continue
-				} else {
-					return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
-				}
-			}
-			break
-		}
+	log.Infof("%s | Deleting instance: %s", d.MachineName, d.InstanceId)
+	if err := d.deleteInstance(); err != nil {
+		return fmt.Errorf("%s | Unable to delete instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
-
-	return err
+	d.InstanceId = ""
+	d.IPAddress = ""
+	d.PrivateIPAddress = ""
+	d.Zone = ""
+	return nil
 }
 
-func (d *Driver) removeRouteEntry(vpcId string, regionId common.Region, instanceId string) error {
-
-	client := d.getClient()
-
-	describeArgs := ecs.DescribeVpcsArgs{
-		VpcId:    vpcId,
-		RegionId: regionId,
-	}
-
-	vpcs, _, err := client.DescribeVpcs(&describeArgs)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to describe VPC %s in region %s: %v", d.MachineName, d.VpcId, d.Region, err)
-	}
-	vrouterId := vpcs[0].VRouterId
-
-	describeRouteTablesArgs := ecs.DescribeRouteTablesArgs{
-		VRouterId: vrouterId,
-	}
-
-	routeTables, _, err := client.DescribeRouteTables(&describeRouteTablesArgs)
-	if err != nil {
-		return fmt.Errorf("%s | Failed to describe route tables: %v", d.MachineName, err)
-	}
-
-	routeEntries := routeTables[0].RouteEntrys.RouteEntry
-
-	// Find route entry associated with instance
-	for _, routeEntry := range routeEntries {
-		count := 0
-
-		if routeEntry.InstanceId == instanceId {
-			for {
-				deleteArgs := ecs.DeleteRouteEntryArgs{
-					RouteTableId:         routeEntry.RouteTableId,
-					DestinationCidrBlock: routeEntry.DestinationCidrBlock,
-					NextHopId:            routeEntry.InstanceId,
-				}
-				log.Infof("%s | Deleting route entry for instance %s ...", d.MachineName, d.InstanceId)
-
-				err := client.DeleteRouteEntry(&deleteArgs)
-				if err != nil {
-					log.Errorf("%s | Failed to delete route entry: %v", d.MachineName, err)
-					count++
-					if count <= maxRetry {
-						time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
-						continue
-					} else {
-						return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
-					}
-				}
-				return nil
-			}
-		}
+func (d *Driver) Restart() error {
+	if err := d.rebootInstance(false); err != nil {
+		return fmt.Errorf("%s | Unable to restart instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
 	return nil
 }
 
-func (d *Driver) addRouteEntry(vpcId string) error {
-
-	if d.RouteCIDR != "" {
-		client := d.getClient()
-
-		describeArgs := ecs.DescribeVpcsArgs{
-			VpcId:    vpcId,
-			RegionId: d.Region,
-		}
-		vpcs, _, err := client.DescribeVpcs(&describeArgs)
-		if err != nil {
-			return fmt.Errorf("%s | Failed to describe VPC %s in region %s: %v", d.MachineName, d.VpcId, d.Region, err)
-		}
-		vrouterId := vpcs[0].VRouterId
-		describeVRoutersArgs := ecs.DescribeVRoutersArgs{
-			VRouterId: vrouterId,
-			RegionId:  d.Region,
-		}
-		vrouters, _, err := client.DescribeVRouters(&describeVRoutersArgs)
-		if err != nil {
-			return fmt.Errorf("%s | Failed to describe VRouters: %v", d.MachineName, err)
-		}
-		routeTableId := vrouters[0].RouteTableIds.RouteTableId[0]
-		count := 0
-
-		for {
-			createArgs := ecs.CreateRouteEntryArgs{
-				RouteTableId:         routeTableId,
-				DestinationCidrBlock: d.RouteCIDR,
-				NextHopType:          ecs.NextHopInstance,
-				NextHopId:            d.InstanceId,
-				ClientToken:          client.GenerateClientToken(),
-			}
-			err = client.CreateRouteEntry(&createArgs)
-			if err == nil {
-				break
-			}
-
-			ecsErr, _ := err.(*common.Error)
-			//Retry for IncorretRouteEntryStatus or Internal Error
-			if ecsErr != nil && (ecsErr.StatusCode == 500 || (ecsErr.StatusCode == 400 && ecsErr.Code == "IncorrectRouteEntryStatus")) {
-				count++
-				if count <= maxRetry {
-					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
-					continue
-				}
-
-			}
-			return fmt.Errorf("%s | Failed to create route entry: %v", d.MachineName, err)
-		}
+func (d *Driver) Kill() error {
+	log.Debugf("%s | Killing instance ...", d.MachineName)
+	if err := d.stopInstance(true); err != nil {
+		return fmt.Errorf("%s | Unable to kill instance %s: %s", d.MachineName, d.InstanceId, err)
 	}
 	return nil
+}
+
+func (d *Driver) GetPrivateIP(inst *ecs.DescribeInstanceAttributeResponse) string {
+	if inst.InnerIpAddress.IpAddress != nil && len(inst.InnerIpAddress.IpAddress) > 0 {
+		return inst.InnerIpAddress.IpAddress[0]
+	}
+	if inst.VpcAttributes.PrivateIpAddress.IpAddress != nil && len(inst.VpcAttributes.PrivateIpAddress.IpAddress) > 0 {
+		return inst.VpcAttributes.PrivateIpAddress.IpAddress[0]
+	}
+	return ""
+}
+
+func (d *Driver) GetIP() (string, error) {
+	inst, err := d.getInstance()
+	if err != nil {
+		return "", err
+	}
+	return d.getIP(inst), nil
 }
 
 func (d *Driver) GetURL() (string, error) {
@@ -890,208 +734,307 @@ func (d *Driver) GetURL() (string, error) {
 	return fmt.Sprintf("tcp://%s:%d", ip, dockerPort), nil
 }
 
-func (d *Driver) GetIP() (string, error) {
-	inst, err := d.getInstance()
-	if err != nil {
-		return "", err
-	}
-
-	return d.getIP(inst), nil
-}
-
-func (d *Driver) GetPrivateIP(inst *ecs.InstanceAttributesType) string {
-	if inst.InnerIpAddress.IpAddress != nil && len(inst.InnerIpAddress.IpAddress) > 0 {
-		return inst.InnerIpAddress.IpAddress[0]
-	}
-
-	if inst.VpcAttributes.PrivateIpAddress.IpAddress != nil && len(inst.VpcAttributes.PrivateIpAddress.IpAddress) > 0 {
-		return inst.VpcAttributes.PrivateIpAddress.IpAddress[0]
-	}
-	return ""
-}
-
-func (d *Driver) getIP(inst *ecs.InstanceAttributesType) string {
-	if d.PrivateIPOnly {
-		return d.GetPrivateIP(inst)
-	}
-	if inst.PublicIpAddress.IpAddress != nil && len(inst.PublicIpAddress.IpAddress) > 0 {
-		return inst.PublicIpAddress.IpAddress[0]
-	}
-	if len(inst.EipAddress.IpAddress) > 0 {
-		return inst.EipAddress.IpAddress
-	}
-	return ""
-}
-
-func (d *Driver) GetState() (state.State, error) {
-	inst, err := d.getInstance()
-	if err != nil {
-		return state.Error, err
-	}
-	switch ecs.InstanceStatus(inst.Status) {
-	case ecs.Starting:
-		return state.Starting, nil
-	case ecs.Running:
-		return state.Running, nil
-	case ecs.Stopping:
-		return state.Stopping, nil
-	case ecs.Stopped:
-		return state.Stopped, nil
-	default:
-		return state.Error, nil
-	}
-}
-
-func (d *Driver) GetSSHHostname() (string, error) {
-	return d.GetIP()
-}
-
-func (d *Driver) Start() error {
-	if err := d.getClient().StartInstance(d.InstanceId); err != nil {
-		log.Errorf("%s | Failed to start instance %s: %v", d.MachineName, d.InstanceId, err)
-		return err
-	}
-
-	// Wait for running
-	err := d.getClient().WaitForInstance(d.InstanceId, ecs.Running, timeout)
-
-	if err != nil {
-		log.Errorf("%s | Failed to wait instance %s running: %v", d.MachineName, d.InstanceId, err)
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) Stop() error {
-	if err := d.getClient().StopInstance(d.InstanceId, false); err != nil {
-		log.Errorf("%s | Failed to stop instance %s: %v", d.MachineName, d.InstanceId, err)
-		return err
-	}
-
-	// Wait for stopped
-	err := d.getClient().WaitForInstance(d.InstanceId, ecs.Stopped, timeout)
-
-	if err != nil {
-		log.Errorf("%s | Failed to wait instance %s stopped: %v", d.MachineName, d.InstanceId, err)
-		return err
-	}
-
-	return nil
-}
-
-func (d *Driver) Remove() error {
-	log.Infof("%s | Remove instance %s ...", d.MachineName, d.InstanceId)
-
-	if d.InstanceId == "" {
-		return fmt.Errorf("%s | Unknown instance id", d.MachineName)
-	}
-
-	s, err := d.GetState()
-	if err == nil && s == state.Running {
-		if err := d.Stop(); err != nil {
-			log.Errorf("%s | Unable to removed the instance %s: %s", d.MachineName, d.InstanceId, err)
+func (d *Driver) checkPrereqs() error {
+	if d.SLBID != "" {
+		request := slb.CreateDescribeLoadBalancerAttributeRequest()
+		request.Scheme = "https"
+		request.LoadBalancerId = d.SLBID
+		client, err := d.getSlbClient()
+		if err != nil {
+			return fmt.Errorf("%s | Invalid --aliyunecs-slb-id: %v", d.MachineName, err)
 		}
-	}
-
-	instance, err := d.getInstance()
-	if err != nil {
-		log.Errorf("%s | Unable to describe the instance %s: %s", d.MachineName, d.InstanceId, err)
-	} else {
-		// Check and release EIP if exists
-		if len(instance.EipAddress.AllocationId) != 0 {
-
-			allocationId := instance.EipAddress.AllocationId
-
-			err = d.getClient().UnassociateEipAddress(allocationId, instance.InstanceId)
-			if err != nil {
-				log.Errorf("%s | Failed to unassociate EIP address from instance %s: %v", d.MachineName, d.InstanceId, err)
-			}
-			err = d.getClient().WaitForEip(instance.RegionId, allocationId, ecs.EipStatusAvailable, 0)
-			if err != nil {
-				log.Errorf("%s | Failed to wait EIP %s available: %v", d.MachineName, allocationId, err)
-			}
-			err = d.getClient().ReleaseEipAddress(allocationId)
-			if err != nil {
-				log.Errorf("%s | Failed to release EIP address: %v", d.MachineName, err)
-			}
+		loadBalancer, err := client.DescribeLoadBalancerAttribute(request)
+		if err != nil {
+			return fmt.Errorf("%s | Invalid --aliyunecs-slb-id: %v", d.MachineName, err)
 		}
-		log.Debugf("%s | instance.VpcAttributes: %++v\n", d.MachineName, instance.VpcAttributes)
-
-		vpcId := instance.VpcAttributes.VpcId
-		if vpcId != "" {
-			// Remove route entry firstly
-			d.removeRouteEntry(vpcId, instance.RegionId, instance.InstanceId)
-		}
-	}
-
-	log.Infof("%s | Deleting instance: %s", d.MachineName, d.InstanceId)
-	if err := d.getClient().DeleteInstance(d.InstanceId); err != nil {
-		return fmt.Errorf("%s | Unable to delete instance %s: %s", d.MachineName, d.InstanceId, err)
-	}
-	d.InstanceId = ""
-	d.IPAddress = ""
-	d.PrivateIPAddress = ""
-	d.Zone = ""
-	return nil
-}
-
-func (d *Driver) Restart() error {
-	if err := d.getClient().RebootInstance(d.InstanceId, false); err != nil {
-		return fmt.Errorf("%s | Unable to restart instance %s: %s", d.MachineName, d.InstanceId, err)
+		d.SLBIPAddress = loadBalancer.Address
 	}
 	return nil
 }
 
-func (d *Driver) Kill() error {
-	log.Debugf("%s | Killing instance ...", d.MachineName)
-
-	if err := d.getClient().StopInstance(d.InstanceId, true); err != nil {
-		return fmt.Errorf("%s | Unable to kill instance %s: %s", d.MachineName, d.InstanceId, err)
-	}
-	return nil
-}
-
-func (d *Driver) getSLBClient() *slb.Client {
-	if d.slbClient == nil {
-		client := slb.NewClient(d.AccessKey, d.SecretKey)
-		client.SetDebug(false)
-		d.slbClient = client
-	}
-	return d.slbClient
-}
-
-func (d *Driver) getClient() *ecs.Client {
+func (d *Driver) getClient() (*ecs.Client, error) {
 	if d.client == nil {
-		client := ecs.NewClient(d.AccessKey, d.SecretKey)
-		if d.APIEndpoint != "" {
-			client.SetEndpoint(d.APIEndpoint)
+		config := sdk.NewConfig()
+		credential := credentials.NewAccessKeyCredential(d.AccessKey, d.SecretKey)
+		client, err := ecs.NewClientWithOptions(d.Region, config, credential)
+		if err != nil {
+			return nil, fmt.Errorf("%s | esc client error: %v", d.MachineName, err)
 		}
-		client.SetUserAgent("AliyunContainerService/docker-machine")
-		client.SetDebug(false)
 		d.client = client
 	}
-	return d.client
+	return d.client, nil
 }
 
-func (d *Driver) getInstance() (*ecs.InstanceAttributesType, error) {
-	return d.getClient().DescribeInstanceAttribute(d.InstanceId)
+func (d *Driver) getSlbClient() (*slb.Client, error) {
+	if d.slbClient == nil {
+		config := sdk.NewConfig()
+		credential := credentials.NewAccessKeyCredential(d.AccessKey, d.SecretKey)
+		client, err := slb.NewClientWithOptions(d.Region, config, credential)
+		if err != nil {
+			return nil, fmt.Errorf("%s | slb error: %v", d.MachineName, err)
+		}
+		d.slbClient = client
+	}
+	return d.slbClient, nil
+}
+
+func (d *Driver) getVpcClient() (*vpc.Client, error) {
+	if d.vpcClient == nil {
+		config := sdk.NewConfig()
+		credential := credentials.NewAccessKeyCredential(d.AccessKey, d.SecretKey)
+		client, err := vpc.NewClientWithOptions(d.Region, config, credential)
+		if err != nil {
+			return nil, fmt.Errorf("%s | vpc error: %v", d.MachineName, err)
+		}
+		d.vpcClient = client
+	}
+	return d.vpcClient, nil
+}
+
+func (d *Driver) configureSecurityGroup(ecsClient *ecs.Client, vpcId string, groupName string, openPort []string) error {
+	log.Debugf("%s | Configuring security group in %s", d.MachineName, d.VpcId)
+	var securityGroup *ecs.DescribeSecurityGroupAttributeResponse
+	request := ecs.CreateDescribeSecurityGroupsRequest()
+	request.Scheme = https
+	request.RegionId = d.Region
+	request.VpcId = vpcId
+	newSecurityGroup := false
+	for {
+		response, err := ecsClient.DescribeSecurityGroups(request)
+		if err != nil {
+			return err
+		}
+		//log.Debugf("DescribeSecurityGroups: %++v\n", groups)
+		for _, grp := range response.SecurityGroups.SecurityGroup {
+			if grp.SecurityGroupName == groupName && grp.VpcId == d.VpcId {
+				log.Debugf("%s | Found existing security group (%s) in %s", d.MachineName, groupName, d.VpcId)
+				securityGroup, _ = d.getSecurityGroup(ecsClient, grp.SecurityGroupId)
+				break
+			}
+		}
+		if securityGroup != nil {
+			break
+		}
+		paginationResult := PaginationResult{
+			response.TotalCount,
+			response.PageNumber,
+			response.PageSize,
+		}
+		nextPage := paginationResult.NextPage()
+		if nextPage == nil {
+			break
+		}
+		request.PageNumber = requests.NewInteger(nextPage.PageNumber)
+		request.PageSize = requests.NewInteger(nextPage.PageSize)
+	}
+	// if not found, create
+	if securityGroup == nil {
+		log.Debugf("%s | Creating security group (%s) in %s", d.MachineName, groupName, d.VpcId)
+		request := ecs.CreateCreateSecurityGroupRequest()
+		request.Scheme = https
+		request.RegionId = d.Region
+		request.SecurityGroupName = groupName
+		request.Description = "Rancher Machine"
+		request.VpcId = vpcId
+		request.ClientToken = CreateRandomString()
+		response, err := ecsClient.CreateSecurityGroup(request)
+		if err != nil {
+			return err
+		}
+		groupId := response.SecurityGroupId
+		newSecurityGroup = true
+		// wait until created (dat eventual consistency)
+		log.Debugf("%s | Waiting for group (%s) to become available", d.MachineName, groupId)
+		if err := mcnutils.WaitFor(d.securityGroupAvailableFunc(ecsClient, groupId)); err != nil {
+			return err
+		}
+		securityGroup, err = d.getSecurityGroup(ecsClient, groupId)
+		if err != nil {
+			return err
+		}
+	}
+	d.SecurityGroupId = securityGroup.SecurityGroupId
+	if newSecurityGroup {
+		perms := d.configureSecurityGroupPermissions(securityGroup, openPort)
+		for _, permission := range perms {
+			log.Debugf("%s | Authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission)
+			args := permission.createAuthorizeSecurityGroupArgs(d.Region, d.SecurityGroupId)
+			args.NicType = "internet"
+			if _, err := ecsClient.AuthorizeSecurityGroup(args); err != nil {
+				log.Warnf("%s | Failed to authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission, err)
+				return err
+			}
+			args.NicType = "intranet"
+			if (d.VpcId == "" && d.VSwitchId == "") && permission.FromPort != dockerPort && permission.ToPort != dockerPort {
+				if _, err := ecsClient.AuthorizeSecurityGroup(args); err != nil {
+					log.Warnf("%s | Failed to authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission, err)
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Driver) getSecurityGroup(ecsClient *ecs.Client, id string) (sg *ecs.DescribeSecurityGroupAttributeResponse, err error) {
+	request := ecs.CreateDescribeSecurityGroupAttributeRequest()
+	request.Scheme = https
+	request.SecurityGroupId = id
+	request.RegionId = d.Region
+	response, err := ecsClient.DescribeSecurityGroupAttribute(request)
+	return response, nil
+}
+
+func (d *Driver) securityGroupAvailableFunc(ecsClient *ecs.Client, id string) func() bool {
+	return func() bool {
+		_, err := d.getSecurityGroup(ecsClient, id)
+		if err == nil {
+			return true
+		}
+		log.Debug(err)
+		return false
+	}
+}
+
+func (d *Driver) configureSecurityGroupPermissions(group *ecs.DescribeSecurityGroupAttributeResponse, openPort []string) []IpPermission {
+	hasSSHPort := false
+	hasDockerPort := false
+	for _, p := range group.Permissions.Permission {
+		portRange := strings.Split(p.PortRange, "/")
+		log.Debugf("%s | portRange %v", d.MachineName, portRange)
+		fromPort, _ := strconv.Atoi(portRange[0])
+		switch fromPort {
+		case 22:
+			hasSSHPort = true
+		case dockerPort:
+			hasDockerPort = true
+		}
+	}
+	perms := []IpPermission{}
+	if !hasSSHPort {
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   22,
+			ToPort:     22,
+			IpRange:    ipRange,
+		})
+	}
+	if !hasDockerPort {
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   dockerPort,
+			ToPort:     dockerPort,
+			IpRange:    ipRange,
+		})
+	}
+	// If a security group is passed in that needs to be opened, the value passed in is used, if not it is created by default
+	if len(openPort) > 0 {
+		for _, p := range openPort {
+			port, protocol, err := SplitPortProto(p)
+			if err != nil {
+				log.Errorf("Open port %s formatting error", p)
+				continue
+			}
+			log.Infof("Add sgp port %v protocol %v", port, protocol)
+			perms = append(perms, IpPermission{
+				IpProtocol: protocol,
+				FromPort:   port,
+				ToPort:     port,
+				IpRange:    ipRange,
+			})
+		}
+	} else {
+		//80
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   80,
+			ToPort:     80,
+			IpRange:    ipRange,
+		})
+		//443
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   443,
+			ToPort:     443,
+			IpRange:    ipRange,
+		})
+		//ICMP
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   -1,
+			ToPort:     -1,
+			IpRange:    ipRange,
+		})
+		//rke begin
+		//apiserver
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   6443,
+			ToPort:     6443,
+			IpRange:    ipRange,
+		})
+		//etcd
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   2379,
+			ToPort:     2380,
+			IpRange:    ipRange,
+		})
+		//kubelet ScedulerPort ControllerPort
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   10250,
+			ToPort:     10252,
+			IpRange:    ipRange,
+		})
+		//KubeProxyPort
+		perms = append(perms, IpPermission{
+			IpProtocol: "tcp",
+			FromPort:   10256,
+			ToPort:     10256,
+			IpRange:    ipRange,
+		})
+		perms = append(perms, IpPermission{
+			IpProtocol: "udp",
+			FromPort:   4789,
+			ToPort:     4789,
+			IpRange:    ipRange,
+		})
+		perms = append(perms, IpPermission{
+			IpProtocol: "udp",
+			FromPort:   8472,
+			ToPort:     8472,
+			IpRange:    ipRange,
+		})
+	}
+	//rke end
+	if d.VpcId != "" || d.VSwitchId != "" {
+		containerIPRange, err := getContainerCIDR(d.RouteCIDR)
+		if err == nil {
+			perms = append(perms, IpPermission{
+				IpProtocol: "all",
+				FromPort:   -1,
+				ToPort:     -1,
+				IpRange:    containerIPRange,
+			})
+		} else {
+			log.Errorf("%s failed to get container bip %++v", group.SecurityGroupId, err)
+		}
+	}
+	log.Debugf("%s | Configuring new permissions: %v", d.MachineName, perms)
+	return perms
 }
 
 func (d *Driver) createKeyPair() error {
-
 	if d.SSHPrivateKeyPath == "" {
 		log.Debugf("%s | SSH key path: %s", d.MachineName, d.GetSSHKeyPath())
-
 		if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
 			return err
 		}
-
 		publicKey, err := ioutil.ReadFile(d.GetSSHKeyPath() + ".pub")
 		if err != nil {
 			return err
 		}
-
 		d.PublicKey = publicKey
 	} else {
 		log.Debugf("%s | Using SSHPrivateKeyPath: %s", d.MachineName, d.SSHPrivateKeyPath)
@@ -1114,323 +1057,258 @@ func (d *Driver) isSwarmMaster() bool {
 	return d.SwarmMaster
 }
 
-func (d *Driver) getSecurityGroup(id string) (sg *ecs.DescribeSecurityGroupAttributeResponse, err error) {
-	args := ecs.DescribeSecurityGroupAttributeArgs{
-		SecurityGroupId: id,
-		RegionId:        d.Region,
-	}
-	return d.getClient().DescribeSecurityGroupAttribute(&args)
-}
-
-func (d *Driver) securityGroupAvailableFunc(id string) func() bool {
-	return func() bool {
-		_, err := d.getSecurityGroup(id)
-		if err == nil {
-			return true
-		}
-		log.Debug(err)
-		return false
-	}
-}
-
-func (d *Driver) configureSecurityGroup(vpcId string, groupName string, openPort []string) error {
-	log.Debugf("%s | Configuring security group in %s", d.MachineName, d.VpcId)
-
-	var securityGroup *ecs.DescribeSecurityGroupAttributeResponse
-
-	args := ecs.DescribeSecurityGroupsArgs{
-		RegionId: d.Region,
-		VpcId:    vpcId,
-	}
-	newSecurityGroup := false
-
-	for {
-		groups, pagination, err := d.getClient().DescribeSecurityGroups(&args)
-		if err != nil {
-			return err
-		}
-		//log.Debugf("DescribeSecurityGroups: %++v\n", groups)
-
-		for _, grp := range groups {
-			if grp.SecurityGroupName == groupName && grp.VpcId == d.VpcId {
-				log.Debugf("%s | Found existing security group (%s) in %s", d.MachineName, groupName, d.VpcId)
-				securityGroup, _ = d.getSecurityGroup(grp.SecurityGroupId)
-				break
-			}
-		}
-
-		if securityGroup != nil {
-			break
-		}
-
-		nextPage := pagination.NextPage()
-		if nextPage == nil {
-			break
-		}
-		args.Pagination = *nextPage
-	}
-
-	// if not found, create
-	if securityGroup == nil {
-		log.Debugf("%s | Creating security group (%s) in %s", d.MachineName, groupName, d.VpcId)
-		creationArgs := ecs.CreateSecurityGroupArgs{
-			RegionId:          d.Region,
-			SecurityGroupName: groupName,
-			Description:       "Rancher Machine",
-			VpcId:             vpcId,
-			ClientToken:       d.getClient().GenerateClientToken(),
-		}
-
-		groupId, err := d.getClient().CreateSecurityGroup(&creationArgs)
-		if err != nil {
-			return err
-		}
-		newSecurityGroup = true
-		// wait until created (dat eventual consistency)
-		log.Debugf("%s | Waiting for group (%s) to become available", d.MachineName, groupId)
-		if err := mcnutils.WaitFor(d.securityGroupAvailableFunc(groupId)); err != nil {
-			return err
-		}
-		securityGroup, err = d.getSecurityGroup(groupId)
-
-		if err != nil {
-			return err
-		}
-	}
-
-	d.SecurityGroupId = securityGroup.SecurityGroupId
-
-	if newSecurityGroup {
-		perms := d.configureSecurityGroupPermissions(securityGroup, openPort)
-
-		for _, permission := range perms {
-			log.Debugf("%s | Authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission)
-			args := permission.createAuthorizeSecurityGroupArgs(d.Region, d.SecurityGroupId)
-			args.NicType = ecs.NicTypeInternet
-			if err := d.getClient().AuthorizeSecurityGroup(args); err != nil {
-				log.Warnf("%s | Failed to authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission, err)
+func (d *Driver) configNetwork(vpcId string, instanceId string) error {
+	var err error
+	if vpcId == "" {
+		// Assign public IP if not private IP only
+		if !d.PrivateIPOnly {
+			// Allocate public IP address for classic network
+			request := ecs.CreateAllocatePublicIpAddressRequest()
+			request.Scheme = https
+			request.InstanceId = instanceId
+			client, err := d.getClient()
+			if err != nil {
 				return err
 			}
-			args.NicType = ecs.NicTypeIntranet
-			//如果是经典网络，则需要去掉2376的内网入规则
-			if (d.VpcId == "" && d.VSwitchId == "") && permission.FromPort != dockerPort && permission.ToPort != dockerPort {
-				if err := d.getClient().AuthorizeSecurityGroup(args); err != nil {
-					log.Warnf("%s | Failed to authorizing group %s with permission: %v", d.MachineName, securityGroup.SecurityGroupName, permission, err)
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-type IpPermission struct {
-	IpProtocol ecs.IpProtocol
-	FromPort   int
-	ToPort     int
-	IpRange    string
-}
-
-func (p *IpPermission) createAuthorizeSecurityGroupArgs(regionId common.Region, securityGroupId string) *ecs.AuthorizeSecurityGroupArgs {
-	args := ecs.AuthorizeSecurityGroupArgs{
-		RegionId:        regionId,
-		SecurityGroupId: securityGroupId,
-		IpProtocol:      p.IpProtocol,
-		SourceCidrIp:    p.IpRange,
-		PortRange:       fmt.Sprintf("%d/%d", p.FromPort, p.ToPort),
-	}
-	return &args
-}
-
-func (d *Driver) configureSecurityGroupPermissions(group *ecs.DescribeSecurityGroupAttributeResponse, openPort []string) []IpPermission {
-	hasSSHPort := false
-	hasDockerPort := false
-	for _, p := range group.Permissions.Permission {
-		portRange := strings.Split(p.PortRange, "/")
-
-		log.Debugf("%s | portRange %v", d.MachineName, portRange)
-		fromPort, _ := strconv.Atoi(portRange[0])
-		switch fromPort {
-		case 22:
-			hasSSHPort = true
-		case dockerPort:
-			hasDockerPort = true
-		}
-	}
-
-	perms := []IpPermission{}
-	if !hasSSHPort {
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   22,
-			ToPort:     22,
-			IpRange:    ipRange,
-		})
-	}
-
-	if !hasDockerPort {
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   dockerPort,
-			ToPort:     dockerPort,
-			IpRange:    ipRange,
-		})
-	}
-
-	// If a security group is passed in that needs to be opened, the value passed in is used, if not it is created by default
-	if len(openPort) > 0 {
-		for _, p := range openPort {
-			port, protocol, err := SplitPortProto(p)
+			response, err := client.AllocatePublicIpAddress(request)
 			if err != nil {
-				log.Errorf("Open port %s formatting error", p)
-				continue
+				err = fmt.Errorf("%s | Error allocate public IP address for instance %s: %v", d.MachineName, instanceId, err)
+			} else {
+				ipAddress := response.IpAddress
+				log.Infof("%s | Allocate publice IP address %s for instance %s successfully", d.MachineName, ipAddress, instanceId)
 			}
-			log.Infof("Add sgp port %v protocol %v", port, protocol)
-			perms = append(perms, IpPermission{
-				IpProtocol: ecs.IpProtocol(protocol),
-				FromPort:   port,
-				ToPort:     port,
-				IpRange:    ipRange,
-			})
 		}
 	} else {
-		//80
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   80,
-			ToPort:     80,
-			IpRange:    ipRange,
-		})
-
-		//443
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   443,
-			ToPort:     443,
-			IpRange:    ipRange,
-		})
-
-		//ICMP
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolICMP,
-			FromPort:   -1,
-			ToPort:     -1,
-			IpRange:    ipRange,
-		})
-
-		//rke begin
-		//apiserver
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   6443,
-			ToPort:     6443,
-			IpRange:    ipRange,
-		})
-
-		//etcd
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   2379,
-			ToPort:     2380,
-			IpRange:    ipRange,
-		})
-
-		//kubelet ScedulerPort ControllerPort
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   10250,
-			ToPort:     10252,
-			IpRange:    ipRange,
-		})
-
-		//KubeProxyPort
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolTCP,
-			FromPort:   10256,
-			ToPort:     10256,
-			IpRange:    ipRange,
-		})
-
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolUDP,
-			FromPort:   4789,
-			ToPort:     4789,
-			IpRange:    ipRange,
-		})
-
-		perms = append(perms, IpPermission{
-			IpProtocol: ecs.IpProtocolUDP,
-			FromPort:   8472,
-			ToPort:     8472,
-			IpRange:    ipRange,
-		})
-	}
-
-	//rke end
-	//如果是容器网段的话，需要设置容器网段开放安全组
-	if d.VpcId != "" || d.VSwitchId != "" {
-		containerIPRange, err := getContainerCIDR(d.RouteCIDR)
-		if err == nil {
-			perms = append(perms, IpPermission{
-				IpProtocol: ecs.IpProtocolAll,
-				FromPort:   -1,
-				ToPort:     -1,
-				IpRange:    containerIPRange,
-			})
-		} else {
-			log.Errorf("%s failed to get container bip %++v", group.SecurityGroupId, err)
+		if err := d.addRouteEntry(vpcId); err != nil {
+			return err
+		}
+		if !d.PrivateIPOnly {
+			// Create EIP for virtual private cloud
+			eipRequest := vpc.CreateAllocateEipAddressRequest()
+			eipRequest.Scheme = https
+			eipRequest.RegionId = d.Region
+			eipRequest.Bandwidth = strconv.Itoa(d.InternetMaxBandwidthOut)
+			eipRequest.InternetChargeType = d.InternetChargeType
+			eipRequest.ClientToken = CreateRandomString()
+			vpcClient, err := d.getVpcClient()
+			if err != nil {
+				return err
+			}
+			response, err := vpcClient.AllocateEipAddress(eipRequest)
+			log.Infof("%s | Allocating Eip address for instance %s ...", d.MachineName, instanceId)
+			if err != nil {
+				log.Errorf("Failed to allocate EIP address: %v", err)
+				return fmt.Errorf("%s | Failed to allocate EIP address: %v", d.MachineName, err)
+			}
+			allocationId := response.AllocationId
+			if err = d.waitForEip(d.Region, allocationId, eipStatusAvailable, 60); err != nil {
+				log.Infof("%s | Releasing Eip address %s for ...", d.MachineName, allocationId)
+				releaseEipRequest := vpc.CreateReleaseEipAddressRequest()
+				releaseEipRequest.Scheme = https
+				releaseEipRequest.RegionId = d.Region
+				releaseEipRequest.AllocationId = allocationId
+				_, err2 := vpcClient.ReleaseEipAddress(releaseEipRequest)
+				if err2 != nil {
+					log.Warnf("%s | Failed to release EIP address: %v", d.MachineName, err2)
+				}
+				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+			}
+			log.Infof("%s | Associating Eip address %s for instance %s ...", d.MachineName, allocationId, instanceId)
+			AssociateEipRequest := ecs.CreateAssociateEipAddressRequest()
+			AssociateEipRequest.Scheme = https
+			AssociateEipRequest.InstanceId = instanceId
+			AssociateEipRequest.AllocationId = allocationId
+			client, err := d.getClient()
+			if err != nil {
+				return err
+			}
+			if _, err = client.AssociateEipAddress(AssociateEipRequest); err != nil {
+				return fmt.Errorf("%s | Failed to associate EIP address: %v", d.MachineName, err)
+			}
+			if err = d.waitForEip(d.Region, allocationId, eipStatusInUse, 60); err != nil {
+				return fmt.Errorf("%s | Failed to wait EIP %s: %v", d.MachineName, allocationId, err)
+			}
 		}
 	}
-
-	log.Debugf("%s | Configuring new permissions: %v", d.MachineName, perms)
-
-	return perms
-}
-
-func getContainerCIDR(cidrBlock string) (string, error) {
-	ip, _, err := net.ParseCIDR(cidrBlock)
-	if err != nil {
-		return "", err
+	if d.SLBID != "" { // Add the instance to SLB
+		log.Infof("%s | Adding instance %s to SLB %s ...", d.MachineName, instanceId, d.SLBID)
+		count := 0
+		for {
+			slbRequest := slb.CreateAddBackendServersRequest()
+			slbRequest.Scheme = https
+			slbRequest.LoadBalancerId = d.SLBID
+			backendServers := []BackendServerType{
+				BackendServerType{
+					ServerId: instanceId,
+					Weight:   100,
+				},
+			}
+			bytes, _ := json.Marshal(backendServers)
+			slbRequest.BackendServers = string(bytes)
+			if _, err := d.slbClient.AddBackendServers(slbRequest); err != nil {
+				log.Errorf("%s | Failed to add instance to SLB: %v", d.MachineName, err)
+				count++
+				if count <= maxRetry {
+					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
+					continue
+				} else {
+					return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
+				}
+			}
+			break
+		}
 	}
-
-	ip = ip.To4()
-	ip[2] = 0
-	ip[3] = 0
-
-	return fmt.Sprintf("%s/16", ip.String()), nil
+	return err
 }
 
-func (d *Driver) deleteSecurityGroup() error {
-	log.Infof("%s | Deleting security group %s", d.MachineName, d.SecurityGroupId)
-	if err := d.getClient().DeleteSecurityGroup(d.Region, d.SecurityGroupId); err != nil {
+func (d *Driver) getImageID(ecsClient *ecs.Client, image string) string {
+	if len(image) != 0 {
+		return image
+	}
+	request := ecs.CreateDescribeImagesRequest()
+	request.RegionId = d.Region
+	request.ImageOwnerAlias = "system"
+	request.Scheme = https
+	// Scan registed images with prefix of default Ubuntu image
+	for {
+		response, err := ecsClient.DescribeImages(request)
+		if err != nil {
+			log.Errorf("%s | Failed to describe images: %v", d.MachineName, err)
+			break
+		} else {
+			for _, image := range response.Images.Image {
+				if strings.HasPrefix(image.ImageId, defaultUbuntuImagePrefix) {
+					return image.ImageId
+				}
+			}
+			paginationResult := PaginationResult{
+				response.TotalCount,
+				response.PageNumber,
+				response.PageSize,
+			}
+			nextPage := paginationResult.NextPage()
+			if nextPage == nil {
+				break
+			}
+			request.PageNumber = requests.NewInteger(nextPage.PageNumber)
+			request.PageSize = requests.NewInteger(nextPage.PageSize)
+		}
+	}
+	//Use default image
+	image = defaultUbuntuImageID
+	return image
+}
+
+func (d *Driver) getInstance() (*ecs.DescribeInstanceAttributeResponse, error) {
+	request := ecs.CreateDescribeInstanceAttributeRequest()
+	request.Scheme = https
+	request.InstanceId = d.InstanceId
+	client, err := d.getClient()
+	if err != nil {
+		return nil, err
+	}
+	response, err := client.DescribeInstanceAttribute(request)
+	if err != nil {
+		return nil, fmt.Errorf("%s | vpc error: %v", d.MachineName, err)
+	}
+	return response, nil
+}
+
+func (d *Driver) stopInstance(forceStop bool) error {
+	request := ecs.CreateStopInstanceRequest()
+	request.Scheme = https
+	request.InstanceId = d.InstanceId
+	request.ForceStop = requests.NewBoolean(forceStop)
+	client, err := d.getClient()
+	if err != nil {
 		return err
 	}
-
-	return nil
+	_, err = client.StopInstance(request)
+	return err
 }
 
-func generateId() string {
-	rb := make([]byte, 10)
-	_, err := rand.Read(rb)
+func (d *Driver) startInstance() error {
+	startInstanceRequest := ecs.CreateStartInstanceRequest()
+	startInstanceRequest.Scheme = https
+	startInstanceRequest.InstanceId = d.InstanceId
+	client, err := d.getClient()
 	if err != nil {
-		log.Errorf("Unable to generate id: %s", err)
+		return err
 	}
+	_, err = client.StartInstance(startInstanceRequest)
+	return err
+}
 
-	h := md5.New()
-	io.WriteString(h, string(rb))
-	return fmt.Sprintf("%x", h.Sum(nil))
+func (d *Driver) deleteInstance() error {
+	request := ecs.CreateDeleteInstanceRequest()
+	request.Scheme = https
+	request.InstanceId = d.InstanceId
+	request.Force = requests.NewBoolean(false)
+	client, err := d.getClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.DeleteInstance(request)
+	return err
+}
+
+func (d *Driver) rebootInstance(forceStop bool) error {
+	request := ecs.CreateRebootInstanceRequest()
+	request.Scheme = https
+	request.InstanceId = d.InstanceId
+	request.ForceStop = requests.NewBoolean(forceStop)
+	client, err := d.getClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.RebootInstance(request)
+	return err
+}
+
+func (d *Driver) unassociateEipAddress(allocationId, instanceId string) error {
+	vpcClient, err := d.getVpcClient()
+	if err != nil {
+		return err
+	}
+	request := vpc.CreateUnassociateEipAddressRequest()
+	request.Scheme = https
+	request.AllocationId = allocationId
+	request.InstanceId = instanceId
+	_, err = vpcClient.UnassociateEipAddress(request)
+	return err
+}
+
+func (d *Driver) releaseEipAddress(allocationId string) error {
+	vpcClient, err := d.getVpcClient()
+	if err != nil {
+		return err
+	}
+	request := vpc.CreateReleaseEipAddressRequest()
+	request.Scheme = https
+	request.AllocationId = allocationId
+	_, err = vpcClient.ReleaseEipAddress(request)
+	return err
+}
+
+func (d *Driver) getIP(inst *ecs.DescribeInstanceAttributeResponse) string {
+	if d.PrivateIPOnly {
+		return d.GetPrivateIP(inst)
+	}
+	if inst.PublicIpAddress.IpAddress != nil && len(inst.PublicIpAddress.IpAddress) > 0 {
+		return inst.PublicIpAddress.IpAddress[0]
+	}
+	if len(inst.EipAddress.IpAddress) > 0 {
+		return inst.EipAddress.IpAddress
+	}
+	return ""
 }
 
 func (d *Driver) configECSInstance(imageId string) error {
 	ipAddr := d.IPAddress
 	port, _ := d.GetSSHPort()
 	tcpAddr := fmt.Sprintf("%s:%d", ipAddr, port)
-
 	log.Infof("%s | Waiting SSH service %s is ready to connect ...", d.MachineName, tcpAddr)
-
 	var auth *ssh.Auth
-
 	if d.SSHPrivateKeyPath == "" {
 		auth = &ssh.Auth{
 			Passwords: []string{d.SSHPassword},
@@ -1440,19 +1318,16 @@ func (d *Driver) configECSInstance(imageId string) error {
 			Keys: []string{d.SSHPrivateKeyPath},
 		}
 	}
-
 	sshConfig, err := ssh.NewNativeConfig(d.GetSSHUsername(), auth)
 	if err != nil {
 		return err
 	}
 	sshConfig.Timeout = sshTimeout * time.Second
-
 	sshClient := &ssh.NativeClient{
 		Config:   sshConfig,
 		Hostname: ipAddr,
 		Port:     port,
 	}
-
 	if retriesExceededErr := mcnutils.WaitForSpecificOrError(func() (bool, error) {
 		err = sshClient.Shell("exit")
 		return err == nil, nil
@@ -1465,37 +1340,228 @@ func (d *Driver) configECSInstance(imageId string) error {
 		}
 		return fmt.Errorf("%s | Unable to init instance: %s(%s)", d.MachineName, d.InstanceId, d.IPAddress)
 	}
-
 	if d.SSHKeyPairName == "" {
 		log.Infof("%s | Uploading SSH keypair to %s ...", d.MachineName, tcpAddr)
-		err = d.uploadKeyPair(sshClient)
-		if err != nil {
+		if err = d.uploadKeyPair(sshClient); err != nil {
 			return err
 		}
 	}
-
 	if isUbuntuImage(imageId) {
 		d.fixAptConf(sshClient)
 	}
-
 	d.fixRoutingRules(sshClient)
-
 	if d.DiskSize > 0 {
 		d.autoFdisk(sshClient)
 	}
-
 	return nil
+}
+
+func (d *Driver) waitForInstance(instanceID string, status string, timeout int) error {
+	if timeout <= 0 {
+		timeout = instanceDefaultTimeout
+	}
+	for {
+		log.Infof("%s | wait %s instance %s ...", status, d.MachineName, instanceID)
+		request := ecs.CreateDescribeInstanceAttributeRequest()
+		request.Scheme = https
+		request.InstanceId = instanceID
+		client, err := d.getClient()
+		if err != nil {
+			return err
+		}
+		instance, err := client.DescribeInstanceAttribute(request)
+		if err != nil {
+			return err
+		}
+		if instance.Status == status {
+			//TODO
+			//Sleep one more time for timing issues
+			time.Sleep(defaultWaitForInterval * time.Second)
+			break
+		}
+		timeout = timeout - defaultWaitForInterval
+		if timeout <= 0 {
+			return errors.New("time out")
+		}
+		time.Sleep(defaultWaitForInterval * time.Second)
+	}
+	return nil
+}
+
+func (d *Driver) waitForEip(regionID string, allocationId string, status string, timeout int) error {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	request := vpc.CreateDescribeEipAddressesRequest()
+	request.Scheme = https
+	request.RegionId = regionID
+	request.AllocationId = allocationId
+	for {
+		vpcClient, err := d.getVpcClient()
+		if err != nil {
+			return err
+		}
+		eips, err := vpcClient.DescribeEipAddresses(request)
+		if err != nil {
+			return err
+		}
+		eipAddress := eips.EipAddresses.EipAddress
+		if len(eipAddress) == 0 {
+			return errors.New("not found")
+		}
+		if eipAddress[0].Status == status {
+			break
+		}
+		timeout = timeout - defaultWaitForInterval
+		if timeout <= 0 {
+			return errors.New("time out")
+		}
+		time.Sleep(defaultWaitForInterval * time.Second)
+	}
+	return nil
+}
+
+func (d *Driver) addRouteEntry(vpcId string) error {
+	if d.RouteCIDR != "" {
+		client, err := d.getClient()
+		if err != nil {
+			return err
+		}
+		vpcRequest := ecs.CreateDescribeVpcsRequest()
+		vpcRequest.Scheme = https
+		vpcRequest.VpcId = vpcId
+		vpcRequest.RegionId = d.Region
+		vpcResponse, err := client.DescribeVpcs(vpcRequest)
+		if err != nil {
+			return fmt.Errorf("%s | Failed to describe VPC %s in region %s: %v", d.MachineName, d.VpcId, d.Region, err)
+		}
+		vpcs := vpcResponse.Vpcs.Vpc
+		vrouterId := vpcs[0].VRouterId
+		vRouterRequest := ecs.CreateDescribeVRoutersRequest()
+		vRouterRequest.Scheme = https
+		vRouterRequest.VRouterId = vrouterId
+		vRouterRequest.RegionId = d.Region
+		vRouterResponse, err := client.DescribeVRouters(vRouterRequest)
+		if err != nil {
+			return fmt.Errorf("%s | Failed to describe VRouters: %v", d.MachineName, err)
+		}
+		vrouters := vRouterResponse.VRouters.VRouter
+		routeTableId := vrouters[0].RouteTableIds.RouteTableId[0]
+		count := 0
+		for {
+			request := ecs.CreateCreateRouteEntryRequest()
+			request.Scheme = https
+			request.RouteTableId = routeTableId
+			request.DestinationCidrBlock = d.RouteCIDR
+			request.NextHopType = "Instance"
+			request.NextHopId = d.InstanceId
+			request.ClientToken = CreateRandomString()
+			_, err := client.CreateRouteEntry(request)
+			if err == nil {
+				break
+			}
+			ecsErr, _ := err.(*Error)
+			//Retry for IncorretRouteEntryStatus or Internal Error
+			if ecsErr != nil && (ecsErr.StatusCode == 500 || (ecsErr.StatusCode == 400 && ecsErr.Code == "IncorrectRouteEntryStatus")) {
+				count++
+				if count <= maxRetry {
+					time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
+					continue
+				}
+			}
+			return fmt.Errorf("%s | Failed to create route entry: %v", d.MachineName, err)
+		}
+	}
+	return nil
+}
+
+func (d *Driver) removeRouteEntry(vpcId, instanceId string) error {
+	client, err := d.getClient()
+	if err != nil {
+		return err
+	}
+	vpcRequest := ecs.CreateDescribeVpcsRequest()
+	vpcRequest.Scheme = https
+	vpcRequest.VpcId = vpcId
+	vpcRequest.RegionId = d.Region
+	vpcResponse, err := client.DescribeVpcs(vpcRequest)
+	if err != nil {
+		return fmt.Errorf("%s | Failed to describe VPC %s in region %s: %v", d.MachineName, d.VpcId, d.Region, err)
+	}
+	vpcs := vpcResponse.Vpcs.Vpc
+	vrouterId := vpcs[0].VRouterId
+	describeRouteTablesRequest := ecs.CreateDescribeRouteTablesRequest()
+	describeRouteTablesRequest.Scheme = https
+	describeRouteTablesRequest.VRouterId = vrouterId
+	response, err := client.DescribeRouteTables(describeRouteTablesRequest)
+	if err != nil {
+		return fmt.Errorf("%s | Failed to describe route tables: %v", d.MachineName, err)
+	}
+	routeTables := response.RouteTables.RouteTable
+	routeEntries := routeTables[0].RouteEntrys.RouteEntry
+	// Find route entry associated with instance
+	for _, routeEntry := range routeEntries {
+		count := 0
+		if routeEntry.InstanceId == instanceId {
+			for {
+				deleteRouteEntryRequest := ecs.CreateDeleteRouteEntryRequest()
+				deleteRouteEntryRequest.Scheme = https
+				deleteRouteEntryRequest.RouteTableId = routeEntry.RouteTableId
+				deleteRouteEntryRequest.DestinationCidrBlock = routeEntry.DestinationCidrBlock
+				deleteRouteEntryRequest.NextHopId = routeEntry.InstanceId
+				log.Infof("%s | Deleting route entry for instance %s ...", d.MachineName, d.InstanceId)
+				client, err := d.getClient()
+				if err != nil {
+					return err
+				}
+				_, err = client.DeleteRouteEntry(deleteRouteEntryRequest)
+				if err != nil {
+					log.Errorf("%s | Failed to delete route entry: %v", d.MachineName, err)
+					count++
+					if count <= maxRetry {
+						time.Sleep(time.Duration(5000+mrand.Int63n(2000)) * time.Millisecond)
+						continue
+					} else {
+						return fmt.Errorf("%s | Failed to delete route entry after %d times", d.MachineName, maxRetry)
+					}
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Driver) addTags() error {
+	request := ecs.CreateAddTagsRequest()
+	request.Scheme = https
+	request.RegionId = d.Region
+	request.ResourceId = d.InstanceId
+	request.ResourceType = "instance"
+	var tagSlice []ecs.AddTagsTag
+	if len(d.Tags) > 0 {
+		for key, value := range d.Tags {
+			addTag := ecs.AddTagsTag{
+				Value: value,
+				Key:   key,
+			}
+			tagSlice = append(tagSlice, addTag)
+		}
+	}
+	request.Tag = &tagSlice
+	client, err := d.getClient()
+	if err != nil {
+		return err
+	}
+	_, err = client.AddTags(request)
+	return err
 }
 
 func (d *Driver) uploadKeyPair(sshClient ssh.Client) error {
 	command := fmt.Sprintf("mkdir -p ~/.ssh; echo '%s' > ~/.ssh/authorized_keys", string(d.PublicKey))
-
 	log.Debugf("%s | Upload the public key with command: %s", d.MachineName, command)
-
 	output, err := sshClient.Output(command)
-
 	log.Debugf("%s | Upload command err, output: %v: %s", d.MachineName, err, output)
-
 	return err
 }
 
@@ -1508,25 +1574,52 @@ func (d *Driver) fixAptConf(sshClient ssh.Client) {
 func (d *Driver) fixRoutingRules(sshClient ssh.Client) {
 	output, err := sshClient.Output("route del -net 172.16.0.0/12")
 	log.Debugf("%s | Delete route command err, output: %v: %s", d.MachineName, err, output)
-
 	output, err = sshClient.Output("if [ -e /etc/network/interfaces ]; then sed -i '/^up route add -net 172.16.0.0 netmask 255.240.0.0 gw/d' /etc/network/interfaces; fi")
 	log.Debugf("%s | Fix route in /etc/network/interfaces command err, output: %v: %s", d.MachineName, err, output)
-
 	output, err = sshClient.Output("if [ -e /etc/sysconfig/network-scripts/route-eth0 ]; then sed -i '/^172.16.0.0\\/12 via /d' /etc/sysconfig/network-scripts/route-eth0; fi")
 	log.Debugf("%s | Fix route in /etc/sysconfig/network-scripts/route-eth0 command err, output: %v: %s", d.MachineName, err, output)
 }
 
-// Mount the addtional disk
 func (d *Driver) autoFdisk(sshClient ssh.Client) {
-
 	s := autoFdiskScriptExt4
-
 	if d.DiskFS == "xfs" {
 		s = autoFdiskScriptXFS
 	}
-
 	script := fmt.Sprintf("cat > ~/machine_autofdisk.sh <<MACHINE_EOF\n%s\nMACHINE_EOF\n", s)
 	output, err := sshClient.Output(script)
 	output, err = sshClient.Output("bash ~/machine_autofdisk.sh")
 	log.Debugf("%s | Auto Fdisk command err, output: %v: %s", d.MachineName, err, output)
+}
+
+func generateId() string {
+	rb := make([]byte, 10)
+	_, err := rand.Read(rb)
+	if err != nil {
+		log.Errorf("Unable to generate id: %s", err)
+	}
+	h := md5.New()
+	io.WriteString(h, string(rb))
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func getContainerCIDR(cidrBlock string) (string, error) {
+	ip, _, err := net.ParseCIDR(cidrBlock)
+	if err != nil {
+		return "", err
+	}
+	ip = ip.To4()
+	ip[2] = 0
+	ip[3] = 0
+	return fmt.Sprintf("%s/16", ip.String()), nil
+}
+
+func (p *IpPermission) createAuthorizeSecurityGroupArgs(regionId string, securityGroupId string) *ecs.AuthorizeSecurityGroupRequest {
+	request := ecs.CreateAuthorizeSecurityGroupRequest()
+	request.Scheme = https
+	request.RegionId = regionId
+	request.SecurityGroupId = securityGroupId
+	request.IpProtocol = p.IpProtocol
+	request.SourceCidrIp = p.IpRange
+	request.PortRange = fmt.Sprintf("%d/%d", p.FromPort, p.ToPort)
+	return request
 }
