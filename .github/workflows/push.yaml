@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build:
@@ -66,10 +67,14 @@ jobs:
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./release-assets
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download all build artifacts (via gh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ./release-assets
+          gh run download ${{ github.run_id }} -R ${{ github.repository }} -D ./release-assets
 
       - name: Flatten files
         run: |
