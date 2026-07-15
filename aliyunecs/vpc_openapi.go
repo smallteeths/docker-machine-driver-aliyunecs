@@ -11,7 +11,7 @@ import (
 	ecs20140526 "github.com/alibabacloud-go/ecs-20140526/v7/client"
 	util "github.com/alibabacloud-go/tea-utils/v2/service"
 	"github.com/alibabacloud-go/tea/tea"
-	vpc20160428 "github.com/alibabacloud-go/vpc-20160428/v6/client"
+	vpc20160428 "github.com/alibabacloud-go/vpc-20160428/v7/client"
 	credential "github.com/aliyun/credentials-go/credentials"
 	"github.com/rancher/machine/libmachine/log"
 )

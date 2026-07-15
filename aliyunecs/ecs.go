@@ -10,7 +10,7 @@ import (
 	ecs20140526 "github.com/alibabacloud-go/ecs-20140526/v7/client"
 	slb20140515 "github.com/alibabacloud-go/slb-20140515/v4/client"
 	"github.com/alibabacloud-go/tea/tea"
-	vpc20160428 "github.com/alibabacloud-go/vpc-20160428/v6/client"
+	vpc20160428 "github.com/alibabacloud-go/vpc-20160428/v7/client"
 	"github.com/rancher/machine/libmachine/drivers"
 	"github.com/rancher/machine/libmachine/log"
 	"github.com/rancher/machine/libmachine/mcnflag"
